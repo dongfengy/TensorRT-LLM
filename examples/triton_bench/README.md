@@ -14,7 +14,7 @@ rm -rf /usr/local/lib/python3.12/dist-packages/triton
 ```
 pip install triton==x.x.x
 ```
-TODO: Provide the version that matches our Triton submodule commit after Triton has new releases that support the latest bench code. For now a workaround is to `pip install /home/scratch.dongfengy_sw_1/triton_moe/triton-3.3.0+gite32c3b13-cp312-cp312-linux_x86_64.whl`
+TODO: Provide the version that matches our Triton submodule commit after Triton has new releases that support the latest bench code. For now a workaround is to `pip install /home/scratch.dongfengy_sw_1/triton_moe/triton-3.3.0+gitc8a45d09-cp312-cp312-linux_x86_64.whl`
 
 ## Install Triton Bench
 
