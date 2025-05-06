@@ -20,3 +20,6 @@
 [submodule "3rdparty/xgrammar"]
 	path = 3rdparty/xgrammar
 	url = https://github.com/mlc-ai/xgrammar.git
+[submodule "3rdparty/triton"]
+	path = 3rdparty/triton
+	url = https://github.com/triton-lang/triton.git
