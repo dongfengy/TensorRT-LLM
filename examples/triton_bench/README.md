@@ -27,6 +27,6 @@ popd
 
 ## Run Benchmarks
 ### Run Demo Bench
-`python bench/bench_mlp.py`
+`python examples/triton_bench/demo_bench.py`
 ### Run Triton Example Bench
 `python 3rdparty/triton/bench/bench/bench_mlp.py`
