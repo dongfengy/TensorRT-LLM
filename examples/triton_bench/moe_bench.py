@@ -466,6 +466,7 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs
     printTorchTensorInfo(gemm1_weights, "gemm1")
     printTorchTensorInfo(gemm2_weights, "gemm2")
     print(f"{top_k} of {num_experts} experts active")
+    print("num runs", n_runs)
 
     with ProfilerTriton("Trtllm") as p:
         for i in range(n_runs):
@@ -658,11 +659,14 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     printTorchTensorInfo(w1, "gemm1")
     printTorchTensorInfo(w2, "gemm2")
     print(f"{n_expts_act} of {n_expts_tot} experts active")
+    print("num runs", n_runs)
+
+    old_x = x
 
     with ProfilerTriton("Trtllm") as p: 
         for i in range(n_runs):
             rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
-            x = matmul_ogs(x, w1, None, rdata, gather_indx=gather_indx, precision_config=pc1)
+            x = matmul_ogs(old_x, w1, None, rdata, gather_indx=gather_indx, precision_config=pc1)
             x = triton_bench.swiglu.swiglu(x, 1.0, pcs, routing_data=rdata)
             x = matmul_ogs(x, w2, None, rdata, scatter_indx=scatter_indx, precision_config=pc2)
 
@@ -675,5 +679,5 @@ import sys
 torch.manual_seed(int(sys.argv[1]))
 print("Running with seed", sys.argv[1])
 
-computeTrtllm(50)
-computeTriton(50)
+computeTrtllm(100)
+computeTriton(100)
