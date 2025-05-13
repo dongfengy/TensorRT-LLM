@@ -495,6 +495,7 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs
         right = atol + rtol * torch.abs(b)
         count = torch.sum(left > right)
         mismatch_percent = count / a.numel()
+        print("Mismatch percentage: %f" % mismatch_percent)
         if mismatch_percent > 1 - percent:
             raise Exception("Mismatch percentage is %f for rtol %f" %
                             (mismatch_percent, rtol))
@@ -506,8 +507,8 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs
                    percent=0.925)
 
 
-def computeTrtllm(n_runs):
-    num_tokens = 1024
+def computeTrtllm(num_tokens,n_runs):
+    #num_tokens = 1024
     num_experts = 128
     hidden_size = 5120
     intermediate_size = 4096
@@ -671,13 +672,19 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
             x = matmul_ogs(x, w2, None, rdata, scatter_indx=scatter_indx, precision_config=pc2)
 
 
-def computeTriton(n_runs):
-    bench_mlp(1024, 5120, 8192, 128, 8, "fp8", "fp8", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs)
+def computeTritonFp8(num_tokens,n_runs):
+    bench_mlp(num_tokens, 5120, 8192, 128, 8, "fp8", "fp8", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs)
+
+
+def computeTritonMx4(num_tokens,n_runs):
+    bench_mlp(num_tokens, 5120, 8192, 128, 8, "fp8", "mx4", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs)
 
 
 import sys
 torch.manual_seed(int(sys.argv[1]))
 print("Running with seed", sys.argv[1])
 
-computeTrtllm(100)
-computeTriton(100)
+for num_tokens in [1, 128, 256, 512, 1024]:
+    computeTrtllm(num_tokens,50)
+    computeTritonFp8(num_tokens,50)
+    computeTritonMx4(num_tokens,50)
