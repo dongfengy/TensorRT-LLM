@@ -623,6 +623,245 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_ru
                    rtol=0.85,
                    percent=0.925)
 
+
+
+def test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size, num_runs,loo):
+    torch.random.manual_seed(0)
+
+    #
+    # Data Generation
+    #
+    num_experts, n_groups, top_k_groups, top_k = expert_info
+    # FIXME: set to TileN size
+    padding = 8
+    routed_scaling = 2.5
+
+    assert top_k <= num_experts
+    assert top_k <= 8
+    assert top_k_groups <= 4
+    assert num_experts > n_groups
+    assert num_experts % n_groups == 0
+    assert num_experts % 4 == 0
+    assert top_k < (top_k_groups * num_experts / n_groups)
+    assert hidden_size % 128 == 0
+    assert intermediate_size % 128 == 0
+
+    expert_logits = torch.randn((num_tokens, num_experts),
+                                device='cuda').to(torch.float)
+    expert_logits=loo.to(expert_logits.dtype)
+    routing_bias = torch.zeros(num_experts, device='cuda', dtype=torch.bfloat16)
+
+    print("using zero for routing bias, routing will be based on top k of expert logits")
+
+    hidden_states = 2 * torch.randn(
+        (num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
+    gemm1_weights = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device='cuda',
+        dtype=torch.bfloat16)
+    gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
+                                device='cuda',
+                                dtype=torch.bfloat16)
+
+    use_ue8m0 = False
+    # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
+    hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, hidden_states_scale_global = quant_fp4(
+        hidden_states, use_ue8m0, True)
+    # We do it twice to get the linear layout for scales for the FP4 kernels.
+    _, hidden_states_scale_linear_fp4_bytes, _ = quant_fp4(
+        hidden_states, use_ue8m0, False)
+
+    hidden_states_fp4 = hidden_states_fp4_bytes.reshape(
+        num_tokens, hidden_size // 2)  # packed fp4
+
+    hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(
+        torch.float8_e4m3fn)  # fp8 scaling factors
+
+    # Quantize the weights for FC1. Produces scales for weights in 128x4 layout for ref impl.
+    gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = quant_fp4_batches(
+        gemm1_weights, num_experts, use_ue8m0, True)
+    # We do it twice to get the linear layout for scales for the FP4 kernels.
+    _, gemm1_scales_linear_fp4_bytes, _ = quant_fp4_batches(
+        gemm1_weights, num_experts, use_ue8m0, False)
+
+    gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(
+        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+                                     hidden_size // 2)  # packed fp4
+    gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+                                     hidden_size // 16)  # fp8 scaling factors
+
+    # Quantize the weights for FC2. Produces scales for weights in 128x4 layout for ref impl.
+    gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = quant_fp4_batches(
+        gemm2_weights, num_experts, use_ue8m0, True)
+    # We do it twice to get the linear layout for scales for the FP4 kernels.
+    _, gemm2_scales_linear_fp4_bytes, _ = quant_fp4_batches(
+        gemm2_weights, num_experts, use_ue8m0, False)
+
+    gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(
+        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+                                     intermediate_size // 2)  # packed fp4
+    gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+                                     intermediate_size //
+                                     16)  # fp8 scaling factors
+
+    permute_info, scores = routing_reference_no_aux(expert_logits, routing_bias,
+                                                    top_k, n_groups,
+                                                    top_k_groups,
+                                                    routed_scaling, padding)
+    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
+                    top_k, padding, hidden_states_fp4_bytes,
+                    hidden_states_scale_fp4_bytes, hidden_states_scale_global,
+                    scores, gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes,
+                    gemm1_scales_global, gemm2_weights_fp4_bytes,
+                    gemm2_scales_fp4_bytes, gemm2_scales_global, permute_info,
+                    False)
+    #
+    # Run the reference implementations
+    #
+    # It is important to run the reference implementation before the TRT-LLM kernel
+    # because the MoE shuffles the weights in-place.
+    output_dequant_reference, args_dequant = run_moe_reference_fp4(args)
+
+    # FIXME: this depends on the kernel internals
+    epilogue_tile_m = 128
+
+    # Reorder rows of W1 and scales for fused gated activation
+    gemm1_weights_fp4_interleaved = []
+    gemm1_scales_fp4_interleaved = []
+    for i in range(num_experts):
+        gemm1_weights_fp4_interleaved.append(
+            reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone()))
+        gemm1_scales_fp4_interleaved.append(
+            reorder_rows_for_gated_act_gemm(gemm1_scales_linear_fp4[i].clone()))
+
+    # Stack weights and scales for all experts
+    gemm1_weights_fp4_interleaved = torch.stack(
+        gemm1_weights_fp4_interleaved).reshape(num_experts,
+                                               2 * intermediate_size,
+                                               hidden_size // 2)
+    gemm1_scales_fp4_interleaved = torch.stack(
+        gemm1_scales_fp4_interleaved).reshape(num_experts,
+                                              2 * intermediate_size,
+                                              hidden_size // 16)
+
+    # Shuffle weights and scaling factors for transposed mma output
+    gemm1_weights_fp4_shuffled = []
+    gemm1_scales_fp4_shuffled = []
+    gemm2_weights_fp4_shuffled = []
+    gemm2_scales_fp4_shuffled = []
+    for i in range(num_experts):
+        gemm1_weights_fp4_shuffled.append(
+            shuffle_matrix_a(gemm1_weights_fp4_interleaved[i].view(torch.uint8),
+                             epilogue_tile_m))
+        gemm1_scales_fp4_shuffled.append(
+            shuffle_matrix_sf_a(
+                gemm1_scales_fp4_interleaved[i].view(torch.uint8),
+                epilogue_tile_m))
+
+        gemm2_weights_fp4_shuffled.append(
+            shuffle_matrix_a(gemm2_weights_fp4[i].view(torch.uint8),
+                             epilogue_tile_m))
+        gemm2_scales_fp4_shuffled.append(
+            shuffle_matrix_sf_a(gemm2_scales_linear_fp4[i].view(torch.uint8),
+                                epilogue_tile_m))
+
+    # Stack weights for all experts
+    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
+    gemm1_scales_fp4_shuffled = torch.stack(gemm1_scales_fp4_shuffled).view(
+        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+                                     hidden_size // 16)
+
+    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
+    gemm2_scales_fp4_shuffled = torch.stack(gemm2_scales_fp4_shuffled).view(
+        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+                                     intermediate_size // 16)
+
+    #
+    # Run the TRT-LLM kernel
+    #
+
+    # c_global_sf: fc2_input_scale
+    scale_c_fc1 = args_dequant.c_global_sf * (
+        1.0 / args.gemm1_scales_global) * (1.0 /
+                                           args.hidden_states_scale_global)
+
+    # self.fc31_alpha
+    scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
+        1.0 / args.hidden_states_scale_global)
+
+    # self.fc2_alpha
+    scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (1.0 /
+                                                      args.gemm2_scales_global)
+
+
+
+    printTorchTensorInfo(hidden_states_fp4, "tokens")
+    printTorchTensorInfo(expert_logits, "logits")
+    print("First two values of logits", expert_logits[0, :2])
+    printTorchTensorInfo(gemm1_weights_fp4_shuffled, "gemm1")
+    printTorchTensorInfo(gemm2_weights_fp4_shuffled, "gemm2")
+    print(f"{top_k} of {num_experts} experts active")
+    print("num runs", num_runs)
+
+    with ProfilerTriton("TrtllmFp4", num_tokens) as p:
+        for i in range(num_runs):
+            output = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                expert_logits,
+                routing_bias,
+                hidden_states_fp4,
+                hidden_states_scale_linear_fp4,
+                gemm1_weights_fp4_shuffled,
+                gemm1_scales_fp4_shuffled,
+                gemm2_weights_fp4_shuffled,
+                gemm2_scales_fp4_shuffled,
+                scale_c_fc1,
+                scale_gate_fc1,
+                scale_c_fc2,
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+            )
+
+    output_dequant_actual = output.to(torch.float)
+
+    #
+    # Check the results
+    #
+    def check_accuracy(a, b, atol, rtol, percent):
+        if torch.any(torch.isnan(a)):
+            raise Exception("NaN in a")
+        if torch.any(torch.isnan(b)):
+            raise Exception("NaN in b")
+        assert a.shape == b.shape
+        left = torch.abs(a - b)
+        right = atol + rtol * torch.abs(b)
+        count = torch.sum(left > right)
+        mismatch_percent = count / a.numel()
+        if mismatch_percent > 1 - percent:
+            raise Exception("Mismatch percentage is %f for rtol %f" %
+                            (mismatch_percent, rtol))
+
+    check_accuracy(output_dequant_reference,
+                   output_dequant_actual,
+                   atol=0.1,
+                   rtol=0.85,
+                   percent=0.925)
+
+
+
+
+
+
+
+
+
 def computeTrtllmFp8(num_tokens,n_runs,loo):
     num_tokens = num_tokens
     num_experts = 128
@@ -634,3 +873,16 @@ def computeTrtllmFp8(num_tokens,n_runs,loo):
     hidden_size = 5120
     intermediate_size = 4096
     test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,n_runs,loo)
+
+
+def computeTrtllmFp4(num_tokens,n_runs,loo):
+    num_tokens = num_tokens
+    num_experts = 128
+    n_groups = 1
+    top_k_groups = 1
+    print("Using n_groups=1 and top_k_groups=1")
+    top_k = 8
+    expert_info = num_experts, n_groups, top_k_groups, top_k
+    hidden_size = 5120
+    intermediate_size = 4096
+    test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size,n_runs,loo)

@@ -1,19 +1,20 @@
 import sys
 from computeTriton import computeTritonFp8, computeTritonMx4
-from computeTrtllm import computeTrtllmFp8
+from computeTrtllm import computeTrtllmFp8, computeTrtllmFp4
 from utils import table_all, table_gemm
 import torch
 
-num_tokens_all = [1, 128, 256, 512, 1024]
+num_tokens_all=[1, 2, 4, 8, 16, 32, 64,128, 256, 512, 1024]
 
 for num_tokens in num_tokens_all:
     expert_logits = torch.randn((num_tokens, 128),
                                 device='cuda').to(torch.float)
     computeTrtllmFp8(num_tokens,50,expert_logits)
+    computeTrtllmFp4(num_tokens,50,expert_logits)
     computeTritonFp8(num_tokens,50,expert_logits)
     computeTritonMx4(num_tokens,50,expert_logits)
 
-names = ["TrtllmFp8", "TritonFp8","TritonMx4"]
+names = ["TrtllmFp8", "TrtllmFp4", "TritonFp8","TritonMx4"]
 print("AllKernels",end="\t")
 for name in names:
     print(f"{name}",end="\t")
