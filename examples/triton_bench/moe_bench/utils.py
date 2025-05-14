@@ -48,10 +48,10 @@ class ProfilerTriton:
         gemm_cnt=0
         for name, t_ns in timings:
             print(f"  {t_ns / 1e6:.3f} ms : {name}")
-            if name.startswith("MoE_Proj") or name.startswith("_matmul_og"):
+            if name.startswith("MoE_Proj") or name.startswith("_matmul_o"):
                 gemm_ns += t_ns
                 gemm_cnt+=1
-        assert gemm_cnt==2
+        assert gemm_cnt==2, f"Expected 2 GEMM kernels, but found {gemm_cnt}."
         print(f"[{self.name}] Total CUDA time: {total_ns / 1e6:.3f} ms")
         print(f"[{self.name}] Total GEMM time: {gemm_ns / 1e6:.3f} ms")
         end_time = time.perf_counter()

@@ -1,9 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from utils import ProfilerTriton, printTorchTensorInfo
 
+import os
+import sys
+
+import pytest
 import torch
 import torch.nn.functional as F
-import tensorrt_llm
-_ = tensorrt_llm # noqa: F401
+
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
 
 class moe_args:
@@ -179,6 +199,7 @@ def routing_reference_no_aux(expert_logits,
         scores = noaux_tc_ref(routing_logits, routing_bias, n_groups,
                               top_k_groups, top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
+    # print("scores: ", scores)
     # print("permute_info: ", permute_info)
     return permute_info, scores
 
@@ -318,6 +339,65 @@ def run_moe_dequant(args, quant_mode=["fp4", "dsFp8", "perTensorFp8"]):
     return finalize_output
 
 
+def e2m1_and_ufp8_scale_to_float_tensor_v2(e2m1_tensor: torch.Tensor,
+                                           ufp8_scale_tensor: torch.Tensor,
+                                           global_scale_tensor: torch.Tensor,
+                                           sf_vec_size,
+                                           ufp8_type: int = 1,
+                                           is_sf_swizzled_layout: bool = True):
+    float_tensor = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+        e2m1_tensor.cpu(),
+        ufp8_scale_tensor.cpu().reshape(-1), global_scale_tensor.cpu(),
+        sf_vec_size, ufp8_type, is_sf_swizzled_layout)
+    return float_tensor
+
+
+def e2m1_and_ufp8_scale_batches(mat_fp4: torch.Tensor,
+                                scale_tensor: torch.Tensor,
+                                global_scale_tensor: torch.Tensor,
+                                sf_vec_size: int,
+                                ufp8_type: int = 1):
+    num_batches = mat_fp4.size(0)
+
+    scale_tensor = scale_tensor.view(num_batches, -1)
+
+    tensors = [
+        e2m1_and_ufp8_scale_to_float_tensor_v2(mat_fp4[b, :, :],
+                                               scale_tensor[b, :],
+                                               global_scale_tensor[b],
+                                               sf_vec_size)
+        for b in range(num_batches)
+    ]
+
+    result = torch.stack(tensors)
+
+    return result
+
+
+def run_moe_reference_fp4(args):
+    sf_vec_size = 16
+
+    hidden_states_dequant = e2m1_and_ufp8_scale_to_float_tensor_v2(
+        args.hidden_states, args.hidden_states_scale,
+        1 / args.hidden_states_scale_global, sf_vec_size).cuda()
+
+    gemm1_weights_dequant = e2m1_and_ufp8_scale_batches(
+        args.gemm1_weights, args.gemm1_scales, 1 / args.gemm1_scales_global,
+        sf_vec_size).cuda()
+
+    gemm2_weights_dequant = e2m1_and_ufp8_scale_batches(
+        args.gemm2_weights, args.gemm2_scales, 1 / args.gemm2_scales_global,
+        sf_vec_size).cuda()
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens, args.num_experts, args.hidden_size,
+        args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
+        args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
+        args.permute_info, args.use_routing_scales_on_input)
+
+    return run_moe_dequant(args_dequant, "fp4"), args_dequant
+
+
 def run_moe_reference_dsfp8(args):
     hidden_states_dequant = dequant_reference_dsfp8(args.hidden_states,
                                                     args.hidden_states_scale,
@@ -342,16 +422,116 @@ def run_moe_reference_dsfp8(args):
     return run_moe_dequant(args_dequant, "dsFp8"), args_dequant
 
 
-def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs):
+def run_moe_reference_per_tensor_scale_fp8(args):
+
+    hidden_states_dequant = args.hidden_states.to(
+        torch.float) / args.hidden_states_scale_global
+
+    gemm1_weights_dequant = {}
+    for i in range(args.num_experts):
+        gemm1_weights_dequant[i] = args.gemm1_weights[i].to(
+            torch.float) / args.gemm1_scales_global[i]
+
+    gemm2_weights_dequant = {}
+    for i in range(args.num_experts):
+        gemm2_weights_dequant[i] = args.gemm2_weights[i].to(
+            torch.float) / args.gemm2_scales_global[i]
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens, args.num_experts, args.hidden_size,
+        args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
+        args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
+        args.permute_info, args.use_routing_scales_on_input)
+
+    return run_moe_dequant(args_dequant, "perTensorFp8"), args_dequant
+
+
+def quant_fp4(a, use_ue8m0=False, is_sf_swizzled_layout=True):
+    a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
+    sf_vec_size = 16
+
+    a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a.cuda(), a_global_sf.cuda(),
+                                                sf_vec_size, use_ue8m0,
+                                                is_sf_swizzled_layout)
+
+    return a_fp4, a_sf, a_global_sf
+
+
+def quant_fp4_batches(a,
+                      num_experts,
+                      use_ue8m0=False,
+                      is_sf_swizzled_layout=True):
+    quant_a = []
+    sfs = []
+    global_sfs = []
+    for i in range(num_experts):
+        a_fp4, a_sf, a_global_sf = quant_fp4(a[i], use_ue8m0,
+                                             is_sf_swizzled_layout)
+        quant_a.append(a_fp4)
+        sfs.append(a_sf)
+        global_sfs.append(a_global_sf)
+
+    result_quant_a = torch.stack(quant_a)
+    result_sfs = torch.stack(sfs)
+    result_global_sfs = torch.stack(global_sfs)
+
+    return result_quant_a, result_sfs, result_global_sfs
+
+
+def quant_dequant_fp4(a, use_ue8m0=False, is_sf_swizzled_layout=True):
+    a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
+    sf_vec_size = 16
+
+    a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a.cuda(), a_global_sf.cuda(),
+                                                sf_vec_size, use_ue8m0,
+                                                is_sf_swizzled_layout)
+
+    a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
+                                                  1 / a_global_sf, sf_vec_size)
+
+    return a_pt.cuda(), a_global_sf
+
+
+def quant_fp8_per_tensor(a):
+    a_global_sf = 448 / a.float().abs().nan_to_num().max()
+
+    a_fp8 = (a * a_global_sf).to(torch.float8_e4m3fn)
+
+    return a_fp8, a_global_sf
+
+
+def quant_fp8_per_tensor_batches(a):
+    num_batches = a.size(0)
+    a_quant = []
+    a_scales = []
+
+    for i in range(num_batches):
+        a_fp8, a_global_sf = quant_fp8_per_tensor(a[i])
+        a_quant.append(a_fp8)
+        a_scales.append(a_global_sf)
+
+    result_a_quant = torch.stack(a_quant)
+    result_a_scales = torch.stack(a_scales)
+
+    return result_a_quant, result_a_scales
+
+
+def quant_dequant_per_tensor_fp8(a):
+    a_global_sf = 448 / a.float().abs().nan_to_num().max()
+    a_fp8 = (a * a_global_sf).to(torch.float8_e4m3fn)
+    a_pt = a_fp8.to(torch.float) / a_global_sf
+
+    return a_pt.cuda(), a_global_sf
+
+
+def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_runs):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8
+    num_experts, n_groups, top_k_groups, top_k = expert_info
     padding = 8
-    n_groups = 8
-    top_k_groups = 4
     routed_scaling = 2.5
 
     assert top_k <= num_experts
@@ -367,6 +547,8 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
     routing_bias = torch.zeros(num_experts, device='cuda', dtype=torch.bfloat16)
+
+    print("using zero for routing bias, routing will be based on top k of expert logits")
 
     hidden_states = torch.randn((num_tokens, hidden_size),
                                 device='cuda').to(torch.float8_e4m3fn)
@@ -400,15 +582,15 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs
     printTorchTensorInfo(gemm1_weights, "gemm1")
     printTorchTensorInfo(gemm2_weights, "gemm2")
     print(f"{top_k} of {num_experts} experts active")
-    print("num runs", n_runs)
+    print("num runs", num_runs)
 
     with ProfilerTriton("TrtllmFp8", num_tokens) as p:
-        for i in range(n_runs):
+        for i in range(num_runs):
             output = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 expert_logits, routing_bias, hidden_states, hidden_states_scale,
-                gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
-                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                0, num_experts, routed_scaling)
+                gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales, num_experts,
+                top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
+                routed_scaling)
 
     output_dequant_actual = output.to(torch.float)
     #
@@ -429,7 +611,6 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs
         right = atol + rtol * torch.abs(b)
         count = torch.sum(left > right)
         mismatch_percent = count / a.numel()
-        print("Mismatch percentage: %f" % mismatch_percent)
         if mismatch_percent > 1 - percent:
             raise Exception("Mismatch percentage is %f for rtol %f" %
                             (mismatch_percent, rtol))
@@ -440,10 +621,14 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size, n_runs
                    rtol=0.85,
                    percent=0.925)
 
-
 def computeTrtllmFp8(num_tokens,n_runs):
-    #num_tokens = 1024
+    num_tokens = num_tokens
     num_experts = 128
+    n_groups = 1
+    top_k_groups = 1
+    print("Using n_groups=1 and top_k_groups=1")
+    top_k = 8
+    expert_info = num_experts, n_groups, top_k_groups, top_k
     hidden_size = 5120
     intermediate_size = 4096
-    test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size,n_runs)
+    test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,n_runs)
