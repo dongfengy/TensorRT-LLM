@@ -14,7 +14,7 @@ for num_tokens in num_tokens_all:
     computeTritonFp8(num_tokens,50,expert_logits)
     computeTritonMx4(num_tokens,50,expert_logits)
 
-names = ["TrtllmFp8", "TrtllmFp4", "TritonFp8","TritonMx4"]
+names = ["TrtllmFp8", "TrtllmFp4", "TritonFp8", "TritonMx4"]
 print("AllKernels",end="\t")
 for name in names:
     print(f"{name}",end="\t")
@@ -22,7 +22,10 @@ print()
 for num_tokens in num_tokens_all:
     print(f"NumTokens={num_tokens}",end="\t")
     for name in names:
-        print(f"{table_all[num_tokens][name]:.3f} ms",end="\t")
+        try:
+            print(f"{table_all[num_tokens][name]:.3f} ms",end="\t")
+        except KeyError:
+            print(f"NaN",end="\t")
     print()
 print("OnlyGemms",end="\t")
 for name in names:
@@ -31,5 +34,8 @@ print()
 for num_tokens in num_tokens_all:
     print(f"NumTokens={num_tokens}",end="\t")
     for name in names:
-        print(f"{table_gemm[num_tokens][name]:.3f} ms",end="\t")
+        try:
+            print(f"{table_gemm[num_tokens][name]:.3f} ms",end="\t")
+        except KeyError:
+            print(f"NaN",end="\t")
     print()

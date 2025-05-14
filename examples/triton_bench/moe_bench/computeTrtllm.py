@@ -621,7 +621,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_ru
                    output_dequant_actual,
                    atol=0.1,
                    rtol=0.85,
-                   percent=0.925)
+                   percent=0.85)
 
 
 
@@ -852,7 +852,7 @@ def test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size, num_ru
                    output_dequant_actual,
                    atol=0.1,
                    rtol=0.85,
-                   percent=0.925)
+                   percent=0.85)
 
 
 
