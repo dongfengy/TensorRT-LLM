@@ -26,6 +26,8 @@ class ProfilerTriton:
         self.name = name
 
     def __enter__(self):
+        torch.cuda.nvtx.range_push(self.name)
+        return
         log_dir = Path("/tmp/bench")
         log_dir.mkdir(parents=True, exist_ok=True)
         self.hatchet = log_dir / "bench.hatchet"
@@ -33,6 +35,8 @@ class ProfilerTriton:
         self.start_time = time.perf_counter()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        torch.cuda.nvtx.range_pop()
+        return
         print("=" * 60)
         proton.finalize()
         with open(self.hatchet) as f:
@@ -664,7 +668,7 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
 
     old_x = x
 
-    with ProfilerTriton("Trtllm") as p: 
+    with ProfilerTriton("triton") as p: 
         for i in range(n_runs):
             rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
             x = matmul_ogs(old_x, w1, None, rdata, gather_indx=gather_indx, precision_config=pc1)
@@ -680,11 +684,21 @@ def computeTritonMx4(num_tokens,n_runs):
     bench_mlp(num_tokens, 5120, 8192, 128, 8, "fp8", "mx4", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs)
 
 
-import sys
-torch.manual_seed(int(sys.argv[1]))
-print("Running with seed", sys.argv[1])
+if False:
+    import sys
+    torch.manual_seed(int(sys.argv[1]))
+    print("Running with seed", sys.argv[1])
 
-for num_tokens in [1, 2,4,8,16,32,64, 128, 256, 512, 1024]:
-    computeTrtllm(num_tokens,50)
-    computeTritonFp8(num_tokens,50)
-    computeTritonMx4(num_tokens,50)
+    for num_tokens in [1, 128, 256, 512, 1024]:
+        computeTrtllm(num_tokens,50)
+        computeTritonFp8(num_tokens,50)
+        computeTritonMx4(num_tokens,50)
+
+if True:
+    # nsys double check
+    torch.cuda.cudart().cudaProfilerStart()
+
+    computeTrtllm(1,50)
+    computeTritonFp8(1,50)
+
+    torch.cuda.cudart().cudaProfilerStop()
