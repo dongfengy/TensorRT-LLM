@@ -524,7 +524,7 @@ def quant_dequant_per_tensor_fp8(a):
     return a_pt.cuda(), a_global_sf
 
 
-def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_runs):
+def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_runs,loo):
     torch.random.manual_seed(0)
 
     #
@@ -546,6 +546,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_ru
 
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
+    expert_logits=loo.to(expert_logits.dtype)
     routing_bias = torch.zeros(num_experts, device='cuda', dtype=torch.bfloat16)
 
     print("using zero for routing bias, routing will be based on top k of expert logits")
@@ -579,6 +580,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_ru
 
     printTorchTensorInfo(hidden_states, "tokens")
     printTorchTensorInfo(expert_logits, "logits")
+    print("First two values of logits", expert_logits[0, :2])
     printTorchTensorInfo(gemm1_weights, "gemm1")
     printTorchTensorInfo(gemm2_weights, "gemm2")
     print(f"{top_k} of {num_experts} experts active")
@@ -621,7 +623,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size, num_ru
                    rtol=0.85,
                    percent=0.925)
 
-def computeTrtllmFp8(num_tokens,n_runs):
+def computeTrtllmFp8(num_tokens,n_runs,loo):
     num_tokens = num_tokens
     num_experts = 128
     n_groups = 1
@@ -631,4 +633,4 @@ def computeTrtllmFp8(num_tokens,n_runs):
     expert_info = num_experts, n_groups, top_k_groups, top_k
     hidden_size = 5120
     intermediate_size = 4096
-    test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,n_runs)
+    test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,n_runs,loo)

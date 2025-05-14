@@ -101,7 +101,7 @@ class PerfData:
         return max(min_t_flop, min_t_bw) / self.time
 
 
-def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name, n_runs, name2):
+def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name, n_runs, name2,loo):
     assert n_expts_tot % EP == 0
     assert dim2 % TP == 0
     dev = "cuda"
@@ -139,9 +139,11 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     # run layer
     assert n_expts_tot > 1
     logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+    logits=loo.to(logits.dtype)
 
     printTorchTensorInfo(x, "tokens")
     printTorchTensorInfo(logits, "logits")
+    print("First two values of logits", logits[0, :2])
     printTorchTensorInfo(w1, "gemm1")
     printTorchTensorInfo(w2, "gemm2")
     print(f"{n_expts_act} of {n_expts_tot} experts active")
@@ -157,9 +159,9 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
             x = matmul_ogs(x, w2, None, rdata, scatter_indx=scatter_indx, precision_config=pc2)
 
 
-def computeTritonFp8(num_tokens,n_runs):
-    bench_mlp(num_tokens, 5120, 8192, 128, 8, "fp8", "fp8", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs,name2="TritonFp8")
+def computeTritonFp8(num_tokens,n_runs,expert_logits):
+    bench_mlp(num_tokens, 5120, 8192, 128, 8, "fp8", "fp8", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs,name2="TritonFp8",loo=expert_logits)
 
 
-def computeTritonMx4(num_tokens,n_runs):
-    bench_mlp(num_tokens, 5120, 8192, 128, 8, "fp8", "mx4", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs,name2="TritonMx4")
+def computeTritonMx4(num_tokens,n_runs,expert_logits):
+    bench_mlp(num_tokens, 5120, 8192, 128, 8, "fp8", "mx4", TP=1, EP=1, name="llama4-maverick", n_runs=n_runs,name2="TritonMx4",loo=expert_logits)
