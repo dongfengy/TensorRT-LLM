@@ -324,6 +324,7 @@ class FusedMoE(nn.Module):
         self.ep_size = model_config.mapping.moe_ep_size
         self.ep_rank = model_config.mapping.moe_ep_rank
         self.moe_backend = model_config.moe_backend
+        print("moe_backend:", self.moe_backend)
         self.use_dp = model_config.mapping.enable_attention_dp
 
         # All ranks participate in allreduce regardless of EP/TP combination
@@ -411,6 +412,7 @@ class FusedMoE(nn.Module):
         if not self.has_any_quant:
             return
         if self.has_fp8_qdq:
+            print("Using fp8 qdq quantization")
             self.quant_scales = FusedMoEQuantScalesFP8(
                 fc1_dequant=self.fc31_dequant,
                 fc2_quant=self.fc2_quant,
@@ -418,11 +420,13 @@ class FusedMoE(nn.Module):
                 fc1_input_dequant=self.fc31_input_dequant,
             )
         elif self.has_fp8_block_scales:
+            print("Using fp8 block scales quantization")
             self.quant_scales = FusedMoEQuantScalesFP8BlockScales(
                 fc_weight_scales=self.w3_w1_weight_scaling_factor,
                 proj_weight_scales=self.w2_weight_scaling_factor,
             )
         elif self.has_nvfp4:
+            print("Using nvfp4 quantization")
             self.quant_scales = FusedMoEQuantScalesNVFP4(
                 fc1_act_global=self.fc31_input_scale,
                 fc1_weight_block=self.w3_w1_weight_scale,
@@ -432,6 +436,7 @@ class FusedMoE(nn.Module):
                 fc2_global=self.fc2_alpha,
             )
         elif self.has_w4afp8:
+            print("Using w4a8 quantization")
             self.quant_scales = FusedMoEQuantScalesW4A8(
                 scale_1_interleaved=self.fc31_weight_scale,
                 scale_2_interleaved=self.fc2_weight_scale,
@@ -447,7 +452,10 @@ class FusedMoE(nn.Module):
         return self.moe_backend == "TRTLLM" and self.has_any_quant
 
     def is_cutlass(self):
-        return not self.is_trtllm()
+        return self.moe_backend=="CUTLASS" or not self.has_any_quant
+
+    def is_triton(self):
+        return self.moe_backend == "TRITON"
 
     def get_quant_scales(self, expert_start, expert_end):
         assert self.smart_router
@@ -937,6 +945,10 @@ class FusedMoE(nn.Module):
                                         all_rank_num_tokens)
         elif self.is_trtllm():
             return self.forward_trtllmgen(x, router_logits)
+        elif self.is_triton():
+            return self.forward_triton(x, router_logits,
+                                        cutlass_min_latency_mode, output_dtype,
+                                        all_rank_num_tokens)
         else:
             raise NotImplementedError(
                 f"FusedMoE only supports CUTLASS or TRTLLM backends, not {self.moe_backend}"
@@ -1133,6 +1145,123 @@ class FusedMoE(nn.Module):
             final_hidden_states = self.all_reduce(final_hidden_states)
 
         return final_hidden_states
+    
+    def forward_triton_details(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        cutlass_min_latency_mode: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens=None,
+    ) -> torch.Tensor:
+        assert isinstance(x, torch.Tensor)
+        output_dtype = x.dtype
+
+        use_fp8_block_scaling = False
+        use_w4a8_group_scaling = False
+        weight_dtype = self.w3_w1_weight.dtype
+
+        token_selected_experts, token_final_scales = self.routing_method.apply(
+            router_logits)
+
+        assert token_selected_experts.shape[
+            1] == self.routing_method.experts_per_token
+        assert token_selected_experts.shape == token_final_scales.shape
+        assert token_selected_experts.shape[0] == router_logits.shape[0]
+        assert token_final_scales.dtype == torch.float32
+        assert token_selected_experts.dtype == torch.int32
+
+        assert not self.apply_router_weight_on_input
+
+        token_count = x.shape[0]
+
+        alltoall_info = None
+
+        assert not self.enable_alltoall
+
+        x_sf = None
+        assert self.has_any_quant
+        assert self.has_fp8_qdq
+        x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                x, self.fc31_input_dequant)
+
+        assert not self.use_dp
+
+        assert not self.smart_router
+
+        ep_size = self.ep_size
+        ep_rank = self.ep_rank
+        w3_w1_weight = self.w3_w1_weight
+        w2_weight = self.w2_weight
+        cluster_size = self.cluster_size
+        cluster_rank = self.cluster_rank
+        quant_scales = self.quant_scales
+
+        assert not self.use_postquant_alltoall
+
+        print(f"forward_triton_details: x.shape={x.shape}, x.dtype={x.dtype}")
+        print(f"forward_triton_details: w3_w1_weight.shape={w3_w1_weight.shape}, w2_weight.shape={w2_weight.shape}")
+        print(f"forward_triton_details: weight_dtype={weight_dtype}, output_dtype={output_dtype}")
+        assert isinstance(quant_scales, FusedMoEQuantScalesFP8)
+        print(f"forward_triton_details: quant_scales.fc1_dequant.shape={quant_scales.fc1_dequant.shape}, quant_scales.fc1_dequant.dtype={quant_scales.fc1_dequant.dtype}")
+        print(f"forward_triton_details: quant_scales.fc2_quant.shape={quant_scales.fc2_quant.shape}, quant_scales.fc2_quant.dtype={quant_scales.fc2_quant.dtype}")
+        print(f"forward_triton_details: quant_scales.fc2_dequant.shape={quant_scales.fc2_dequant.shape}, quant_scales.fc2_dequant.dtype={quant_scales.fc2_dequant.dtype}")
+        print(f"forward_triton_details: quant_scales.fc1_input_dequant.shape={quant_scales.fc1_input_dequant.shape}, quant_scales.fc1_input_dequant.dtype={quant_scales.fc1_input_dequant.dtype}")
+
+        final_hidden_states = torch.ops.trtllm.fused_moe(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            w3_w1_weight.view(weight_dtype),
+            w2_weight.view(weight_dtype),
+            output_dtype,
+            quant_scales=quant_scales,
+            input_sf=x_sf,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
+            use_fp8_block_scaling=use_fp8_block_scaling,
+            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            min_latency_mode=cutlass_min_latency_mode,
+        )
+
+        assert not cutlass_min_latency_mode
+
+        final_hidden_states = final_hidden_states[0]
+
+        assert not self.enable_alltoall
+        return final_hidden_states
+
+
+    def forward_triton(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        cutlass_min_latency_mode: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        assert self.is_triton()
+        assert not self.use_dp
+        max_chunk_size = self.moe_max_num_tokens
+        num_rows = x.shape[0]
+        num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
+        assert num_chunks ==1
+        assert self.parallel_size == 1
+
+        print(f"forward_triton: called with x.shape={x.shape}, x.dtype={x.dtype}, router_logits.shape={router_logits.shape}, router_logits.dtype={router_logits.dtype}")
+        print(f"forward_triton: cutlass_min_latency_mode={cutlass_min_latency_mode}, output_dtype={output_dtype}, all_rank_num_tokens={all_rank_num_tokens}")
+        outputs = self.forward_triton_details(
+            x,
+            router_logits,
+            cutlass_min_latency_mode,
+            output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens)
+        print(f"forward_triton: outputs.shape={outputs.shape}, outputs.dtype={outputs.dtype}")
+        return outputs
 
     def alltoall_prepare_maybe_dispatch(self, all_rank_num_tokens: list,
                                         x: torch.Tensor,

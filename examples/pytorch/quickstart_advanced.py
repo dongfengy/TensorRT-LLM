@@ -13,6 +13,13 @@ example_prompts = [
     "The future of AI is",
 ]
 
+def log_with_time(msg):
+    import time
+    current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"[{current_time}] {msg}")
+    import sys
+    sys.stdout.flush()
+
 
 def add_llm_args(parser):
     parser.add_argument('--model_dir',
@@ -51,7 +58,7 @@ def add_llm_args(parser):
     parser.add_argument('--moe_backend',
                         type=str,
                         default='CUTLASS',
-                        choices=['CUTLASS', 'TRTLLM'])
+                        choices=['CUTLASS', 'TRTLLM', 'TRITON'])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
@@ -185,8 +192,12 @@ def main():
     args = parse_arguments()
     prompts = args.prompt if args.prompt else example_prompts
 
+    log_with_time("Initializing LLM...")
     llm, sampling_params = setup_llm(args)
+    log_with_time("LLM initialized.")
+    log_with_time("Generating text...")
     outputs = llm.generate(prompts, sampling_params)
+    log_with_time("Text generation completed.")
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
