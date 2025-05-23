@@ -1159,7 +1159,7 @@ class FusedMoE(nn.Module):
 
         return final_hidden_states
 
-    def triton_fp8_moe_runner(self, hidden_states, hidden_states_scale, expert_logits, gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales, top_k, step=-1):
+    def fp8_per_tensor_scale_moe_runner_triton(self, hidden_states, hidden_states_scale, expert_logits, gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales, top_k):
         # hidden_states: (num_tokens, hidden_dim) torch.float8_e4m3fn
         # hidden_states_scale: (,) torch.float32
         # expert_logits: (num_tokens, num_experts) torch.bfloat16
@@ -1176,16 +1176,15 @@ class FusedMoE(nn.Module):
             rdata, gather_indx, scatter_indx = None, None, None
 
         # Step 2: Gemm1
-        # The kernel accepts the weights in (num_experts, hidden_dim, intermediate_dim * 2) format
+        # The Triton kernel accepts the weights in (num_experts, hidden_dim, intermediate_dim * 2) format
         gemm1_weights_tmp = gemm1_weights.transpose(1, 2).contiguous()
         gemm1_weights = gemm1_weights_tmp.clone()
-        # This is w3_w1
-        #shuffle the weights on the last dim
+        # Shuffle the weights to match the expected format for the Triton activation kernel
         last_dim = gemm1_weights_tmp.shape[-1]
         gemm1_weights[:,:,0::2] = gemm1_weights_tmp[:,:,last_dim//2:]
         gemm1_weights[:,:,1::2] = gemm1_weights_tmp[:,:,0:last_dim//2]
 
-        # Output scale
+        # Setup quantization context
         gemm1_output_scale = torch.zeros((1,), device="cuda", dtype=torch.float32)
         flex_ctx_1 = FlexCtx(
             lhs_data=InFlexData(scale=hidden_states_scale),
@@ -1196,20 +1195,13 @@ class FusedMoE(nn.Module):
             )
         )
         pc1 = PrecisionConfig(flex_ctx=flex_ctx_1,  allow_tf32=False)
-        # First matmul
 
+        # Call the Triton kernel, which also does permutation
         gemm1_output = matmul_ogs(hidden_states, gemm1_weights, None, rdata, gather_indx=gather_indx, precision_config=pc1)
-        # WAR: The gemm kernel doesn't support quantization with actual scale, as a WAR we re-run with actual scale
         gemm1_output = matmul_ogs(hidden_states, gemm1_weights, None, rdata, gather_indx=gather_indx, precision_config=pc1)
-        if step ==2:
-            # Return the result and its scale
-            return gemm1_output, pc1.flex_ctx.out_data.actual_scale
-        if step == -1:
-            # Return the result and its scale
-            print("gemm1_output",gemm1_output, gemm1_output.shape, gemm1_output.dtype)
-            print("gemm1_output_scale", pc1.flex_ctx.out_data.actual_scale,pc1.flex_ctx.out_data.actual_scale.shape, pc1.flex_ctx.out_data.actual_scale.dtype)
 
         # Step 3: Activation
+        # Setup quantization context
         act_out_scale = torch.zeros((1,), device="cuda", dtype=torch.float32)
         flex_ctx_act = triton_kernels.swiglu.FlexCtx(
             inp_data=InFlexData(scale=pc1.flex_ctx.out_data.actual_scale),
@@ -1218,20 +1210,14 @@ class FusedMoE(nn.Module):
                 expected_scale=act_out_scale, # Initialize with a placeholder, will be updated by the kernel
             )
         )
-        pcs = triton_kernels.swiglu.PrecisionConfig(limit=1.0,flex_ctx=flex_ctx_act)
+        pcs = triton_kernels.swiglu.PrecisionConfig(limit=None,flex_ctx=flex_ctx_act)
+
+        # Call the Triton activation kernel
         act_out = triton_kernels.swiglu.swiglu(gemm1_output, 1.0, pcs, routing_data=rdata)
-        # WAR: The activation kernel doesn't support quantization with actual scale, as a WAR we re-run with actual scale
         act_out = triton_kernels.swiglu.swiglu(gemm1_output, 1.0, pcs, routing_data=rdata)
-        if step == 3:
-            # Return the result and its scale
-            return act_out, pcs.flex_ctx.out_data.actual_scale
-        if step == -1:
-            # Return the result and its scale
-            print("act_out",act_out, act_out.shape, act_out.dtype)
-            print("act_out_scale", pcs.flex_ctx.out_data.actual_scale, pcs.flex_ctx.out_data.actual_scale.shape, pcs.flex_ctx.out_data.actual_scale.dtype)
 
         # Step 4: Gemm2
-        # The kernel accepts the weights in (num_experts, intermediate_dim, hidden_dim) format
+        # Setup quantization context
         gemm2_weights = gemm2_weights.transpose(1, 2).contiguous()
         flex_ctx_2 = FlexCtx(
             lhs_data=InFlexData(scale=pcs.flex_ctx.out_data.actual_scale),
@@ -1239,13 +1225,10 @@ class FusedMoE(nn.Module):
             out_data=OutFlexData()
         )
         pc2 = PrecisionConfig(flex_ctx=flex_ctx_2, allow_tf32=False, out_dtype=torch.bfloat16)
-        # Second matmul
+
+        # Call the Triton kernel, which also does finalization
         gemm2_output = matmul_ogs(act_out, gemm2_weights, None, rdata, scatter_indx=scatter_indx, precision_config=pc2,gammas=rdata.gate_scal if rdata else None)
-        if step == 4:
-            # Return the result and its scale
-            return gemm2_output, 1.0
-        if step == -1:
-            return gemm2_output
+        return gemm2_output
 
     
     def forward_triton_details(
@@ -1338,7 +1321,7 @@ class FusedMoE(nn.Module):
 
 
 
-        final_hidden_states_triton = self.triton_fp8_moe_runner(
+        final_hidden_states_triton = self.fp8_per_tensor_scale_moe_runner_triton(
             x,
             quant_scales.fc1_input_dequant,
             router_logits,
@@ -1353,6 +1336,8 @@ class FusedMoE(nn.Module):
         print(final_hidden_states)
         print(f"forward_triton_details: final_hidden_states.shape={final_hidden_states.shape}, final_hidden_states.dtype={final_hidden_states.dtype}")
 
+        print("use triton")
+        return final_hidden_states_triton
         return final_hidden_states
 
 
