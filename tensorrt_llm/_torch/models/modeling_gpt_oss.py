@@ -457,7 +457,7 @@ class Transformer(DecoderModel):
 
         # Triton MoE kernels require installing Triton main branch,
         # which may be incompatible with torch.compile due to version mismatch.
-        enable_torch_compile_for_embedding = model_config.moe_backend != "TRITON"
+        enable_torch_compile_for_embedding = False
 
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since

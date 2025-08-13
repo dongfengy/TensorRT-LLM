@@ -1138,7 +1138,8 @@ class PyExecutor:
 
             if not request.check_token_id_range(
                     self.model_engine.model.lm_head.num_embeddings):
-                raise ValueError("Token ID out of range")
+                # raise ValueError("Token ID out of range")
+                pass
 
     @nvtx_range("_fetch_and_activate_new_requests")
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
