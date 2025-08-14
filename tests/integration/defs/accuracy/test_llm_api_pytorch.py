@@ -2487,7 +2487,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
-    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+    MODEL_PATH = f"/workspace/gpt-oss-120b-new"
 
     def update_task_kwargs(self, task):
         task.EVALUATOR_KWARGS["fewshot_as_multiturn"] = True
@@ -2515,7 +2515,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_expert_parallel_size=1,
                   kv_cache_config=self.kv_cache_config,
                   **pytorch_config,
-                  moe_config=MoeConfig(backend=moe_backend))
+                  moe_config=MoeConfig(backend=moe_backend),
+                  max_batch_size=64)
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
@@ -2537,10 +2538,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
-            if tp_size != ep_size:
-                pytest.skip(
-                    "TRITON moe backend currently doesn't supported mxfp4 tp for this size"
-                )
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2553,7 +2550,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   kv_cache_config=self.kv_cache_config,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
-                  moe_config=MoeConfig(backend=moe_backend))
+                  moe_config=MoeConfig(backend=moe_backend),
+                  max_batch_size=128)
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
@@ -2589,6 +2587,83 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             model_name = "GPT-OSS/BF16"
             task = GSM8K(model_name)
             task = self.update_task_kwargs(task)
+            task.evaluate(llm)
+
+
+class TestGPTOSSLegacy(LlmapiAccuracyTestHarness):
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+
+    def get_gpt_oss_root(self):
+        gpt_oss_root = os.getenv("GPT_OSS_MODELS_ROOT")
+        assert gpt_oss_root, "GPT_OSS_MODELS_ROOT needs to be set as parent of checkpoints."
+        return gpt_oss_root
+
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"],
+                             ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (True, True),
+    ])
+    def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler):
+        if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(f"{self.get_gpt_oss_root()}/gpt-oss-120b",
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  moe_config=MoeConfig(backend=moe_backend),
+                  max_batch_size=128)
+
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (4, 1, 1, False, True, True),
+            (4, 1, 4, False, True, True),
+            (4, 1, 4, True, True, True),
+            (2, 1, 1, False, True, True),
+            (2, 1, 2, False, True, True),
+            (2, 1, 2, True, True, True),
+        ],
+        ids=["tp4", "ep4", "dp4", "tp2", "ep2", "dp2"])
+    def test_w4_multigpu(self, moe_backend, tp_size, pp_size, ep_size,
+                         attention_dp, cuda_graph, overlap_scheduler):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(f"{self.get_gpt_oss_root()}/gpt-oss-120b",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_config=MoeConfig(backend=moe_backend),
+                  max_batch_size=128)
+
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
             task.evaluate(llm)
 
 
