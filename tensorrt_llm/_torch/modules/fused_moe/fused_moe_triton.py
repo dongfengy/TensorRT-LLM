@@ -668,7 +668,6 @@ def shard_and_pad_tensor(
     tp_rank: int,
     device: torch.device,
 ) -> torch.Tensor:
-    assert tensor.device == torch.device("cpu")
     assert tensor.dim() in [1,
                             2], "Expecting single expect gemm weights or biases"
     assert shard_axis in [0, 1], "Shard axis must be 0 or 1"
@@ -679,7 +678,7 @@ def shard_and_pad_tensor(
     # First we pad the sharded axis
     if shard_axis < tensor.dim():
         padded_size = get_padded_size(tensor.shape[shard_axis],
-                                      padding[shard_axis])
+                                      padding[shard_axis] * tp_size)
         assert 0 <= tp_rank < tp_size
         assert tensor.shape[shard_axis] <= padded_size
         assert padded_size % tp_size == 0
@@ -690,30 +689,23 @@ def shard_and_pad_tensor(
         shard_end = min(shard_start + shard_size, tensor.shape[shard_axis])
         actual_size = shard_end - shard_start
 
-        sharded = tensor.narrow(shard_axis, shard_start, actual_size)
+        tensor = tensor.narrow(shard_axis, shard_start, actual_size)
         size_to_pad[shard_axis] = shard_size - actual_size
 
     # Now we pad the non-sharded axis
     non_shard_axis = 1 - shard_axis
     if non_shard_axis < tensor.dim():
-        padded_size = get_padded_size(sharded.shape[non_shard_axis],
+        padded_size = get_padded_size(tensor.shape[non_shard_axis],
                                       padding[non_shard_axis])
-        size_to_pad[
-            non_shard_axis] = padded_size - sharded.shape[non_shard_axis]
+        size_to_pad[non_shard_axis] = padded_size - tensor.shape[non_shard_axis]
 
     # Actually call pad
     if any(size_to_pad):
-        if sharded.dim() == 1:
-            sharded = torch.nn.functional.pad(sharded, (0, size_to_pad[0]),
-                                              mode='constant',
-                                              value=0)
-        else:
-            sharded = torch.nn.functional.pad(
-                sharded, (0, size_to_pad[1], 0, size_to_pad[0]),
-                mode='constant',
-                value=0)
+        pad = (0, size_to_pad[0]) if tensor.dim() == 1 else (0, size_to_pad[1],
+                                                             0, size_to_pad[0])
+        tensor = torch.nn.functional.pad(tensor, pad)
 
-    return sharded.to(device)
+    return tensor.to(device)
 
 
 # We inherit from TritonUnquantizedFusedMoEMethod to reuse the weight preprocessing logic
@@ -762,12 +754,17 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             w2_weight_shape[2],
         )
 
+        w3_w1_bias_shape = (w3_w1_weight_shape[0], w3_w1_weight_shape[2])
+        w2_bias_shape = (w2_weight_shape[0], w2_weight_shape[2])
+
         FusedMoEMethodBase.create_weights(self,
                                           module,
                                           weight_dtype,
                                           w3_w1_weight_shape,
                                           w2_weight_shape,
-                                          bias_dtype=torch.float32)
+                                          bias_dtype=torch.float32,
+                                          w3_w1_bias_shape=w3_w1_bias_shape,
+                                          w2_bias_shape=w2_bias_shape)
 
         fc31_dequant = nn.Parameter(
             torch.empty(w3_w1_scale_shape, dtype=torch.uint8),  # mxfp8 scale
@@ -888,22 +885,30 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         """
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
-        # n_padding is dividied by 2 because w1 and w3 are concatenated along n dimension
-        # k_padding is dividied by 2 because two mxfp4 values are packed into a byte
+        # Use full k-padding for float tensors, half for already-packed uint8
+        k_pad = self.k_padding if w1_weight.dtype in (
+            torch.bfloat16, torch.float16,
+            torch.float32) else self.k_padding // 2
+        # n is halved per-branch because we concatenate w1/w3 along N later
+        n_pad = self.n_padding // 2
+        print("w1 shard_and_pad_tensor before", w1_weight.shape)
         w1_weight_shard = shard_and_pad_tensor(w1_weight,
                                                0,
-                                               self.n_padding // 2,
-                                               self.k_padding // 2,
+                                               n_pad,
+                                               k_pad,
                                                module.tp_size,
                                                module.tp_rank,
                                                device=device)
+        print("w1 shard_and_pad_tensor after", w1_weight_shard.shape)
+        print("w3 shard_and_pad_tensor before", w3_weight.shape)
         w3_weight_shard = shard_and_pad_tensor(w3_weight,
                                                0,
-                                               self.n_padding // 2,
-                                               self.k_padding // 2,
+                                               n_pad,
+                                               k_pad,
                                                module.tp_size,
                                                module.tp_rank,
                                                device=device)
+        print("w3 shard_and_pad_tensor after", w3_weight_shard.shape)
 
         if not is_bias and w3_weight_shard.dtype in (torch.bfloat16,
                                                      torch.float16,
@@ -935,6 +940,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             w31_weight_shard = shuffle_weight_for_activation_kernel(
                 w31_weight_shard)
 
+        print("w31 final shape", w31_weight_shard.shape)
+
         dst_w3_w1_weight.copy_(w31_weight_shard, non_blocking=True)
         return (w3_scales, w1_scales)
 
@@ -949,15 +956,18 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         """
         device = dst_w2_weight.device
         assert device.type == "cuda"
-        # k_padding is dividied by 2 because two mxfp4 values are packed into a byte
+        k_pad = self.k_padding if w2_weight.dtype in (
+            torch.bfloat16, torch.float16,
+            torch.float32) else self.k_padding // 2
+        print("w2 shard_and_pad_tensor before", w2_weight.shape)
         w2_weight_shard = shard_and_pad_tensor(w2_weight,
                                                1,
                                                self.n_padding,
-                                               self.k_padding // 2,
+                                               k_pad,
                                                module.tp_size,
                                                module.tp_rank,
                                                device=device)
-
+        print("w2 shard_and_pad_tensor after", w2_weight_shard.shape)
         w2_scales = None
 
         if is_bias:
@@ -976,6 +986,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 # Transpose the weights to match the expected format for the Triton gemm kernel
                 # [N, K] -> [K, N]
                 w2_weight_shard = w2_weight_shard.transpose(0, 1).contiguous()
+
+        print("w2 final shape", w2_weight_shard.shape)
 
         dst_w2_weight.copy_(w2_weight_shard, non_blocking=True)
 
