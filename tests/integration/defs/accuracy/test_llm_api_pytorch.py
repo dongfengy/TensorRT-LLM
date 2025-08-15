@@ -2529,10 +2529,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 1, False, True, True),
+            (8, 1, 1, False, True, True),
             (4, 1, 4, False, True, True),
-            (4, 1, 4, True, True, True),
+            (8, 1, 8, True, True, True),
         ],
-        ids=["tp4", "ep4", "dp4"])
+        ids=["tp4", "tp8", "ep4", "dp8"])
     def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
                       attention_dp, cuda_graph, overlap_scheduler):
         if moe_backend == "TRITON":
