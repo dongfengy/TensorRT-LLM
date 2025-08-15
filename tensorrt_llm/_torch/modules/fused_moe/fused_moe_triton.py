@@ -891,7 +891,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             torch.float32) else self.k_padding // 2
         # n is halved per-branch because we concatenate w1/w3 along N later
         n_pad = self.n_padding // 2
-        print("w1 shard_and_pad_tensor before", w1_weight.shape)
         w1_weight_shard = shard_and_pad_tensor(w1_weight,
                                                0,
                                                n_pad,
@@ -899,8 +898,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                                module.tp_size,
                                                module.tp_rank,
                                                device=device)
-        print("w1 shard_and_pad_tensor after", w1_weight_shard.shape)
-        print("w3 shard_and_pad_tensor before", w3_weight.shape)
         w3_weight_shard = shard_and_pad_tensor(w3_weight,
                                                0,
                                                n_pad,
@@ -908,7 +905,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                                module.tp_size,
                                                module.tp_rank,
                                                device=device)
-        print("w3 shard_and_pad_tensor after", w3_weight_shard.shape)
 
         if not is_bias and w3_weight_shard.dtype in (torch.bfloat16,
                                                      torch.float16,
@@ -940,8 +936,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             w31_weight_shard = shuffle_weight_for_activation_kernel(
                 w31_weight_shard)
 
-        print("w31 final shape", w31_weight_shard.shape)
-
         dst_w3_w1_weight.copy_(w31_weight_shard, non_blocking=True)
         return (w3_scales, w1_scales)
 
@@ -959,7 +953,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         k_pad = self.k_padding if w2_weight.dtype in (
             torch.bfloat16, torch.float16,
             torch.float32) else self.k_padding // 2
-        print("w2 shard_and_pad_tensor before", w2_weight.shape)
         w2_weight_shard = shard_and_pad_tensor(w2_weight,
                                                1,
                                                self.n_padding,
@@ -967,7 +960,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                                module.tp_size,
                                                module.tp_rank,
                                                device=device)
-        print("w2 shard_and_pad_tensor after", w2_weight_shard.shape)
         w2_scales = None
 
         if is_bias:
@@ -987,8 +979,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 # [N, K] -> [K, N]
                 w2_weight_shard = w2_weight_shard.transpose(0, 1).contiguous()
 
-        print("w2 final shape", w2_weight_shard.shape)
-
         dst_w2_weight.copy_(w2_weight_shard, non_blocking=True)
 
         return w2_scales
@@ -998,26 +988,32 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             w3_weight_scale: torch.Tensor, dst_w3_w1_weight_scale: torch.Tensor,
             transpose_scales: bool):
         if transpose_scales:
-            # (intermediate_dim * 2, hidden_dim / 32)
-            combined_scale = torch.cat([w3_weight_scale, w1_weight_scale],
-                                       dim=0)
-            # (hidden_dim / 32, intermediate_dim * 2)
-            combined_scale = combined_scale.transpose(0, 1)
-        else:
-            # (hidden_dim / 32, intermediate_dim * 2)
-            combined_scale = torch.cat([w3_weight_scale, w1_weight_scale],
-                                       dim=1)
+            w1_weight_scale = w1_weight_scale.transpose(
+                0, 1)  # (hidden_dim / 32, intermediate_dim)
+            w3_weight_scale = w3_weight_scale.transpose(
+                0, 1)  # (hidden_dim / 32, intermediate_dim)
 
-        # k_padding is divided by 32 because every 32 values share a single scale
         # Swapping n_padding and k_padding here because we have already transposed
-        combined_scale = shard_and_pad_tensor(
-            combined_scale,
+        w1_weight_scale = shard_and_pad_tensor(
+            w1_weight_scale,
             1,
             self.k_padding // 32,
-            self.n_padding,
+            self.n_padding // 2,
             module.tp_size,
             module.tp_rank,
             device=dst_w3_w1_weight_scale.device)
+
+        w3_weight_scale = shard_and_pad_tensor(
+            w3_weight_scale,
+            1,
+            self.k_padding // 32,
+            self.n_padding // 2,
+            module.tp_size,
+            module.tp_rank,
+            device=dst_w3_w1_weight_scale.device)
+
+        # (hidden_dim / 32, intermediate_dim * 2)
+        combined_scale = torch.cat([w3_weight_scale, w1_weight_scale], dim=1)
 
         dst_w3_w1_weight_scale.copy_(combined_scale, non_blocking=True)
 
@@ -1109,7 +1105,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             tmp_w3_w1_weight_scale)
 
         # Handle w3_w1_weight
-
         tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
             module.w3_w1_weight.data, tmp_w3_w1_weight_scale)
 
@@ -1121,7 +1116,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         module.fc31_dequant = tmp_w3_w1_weight_scale
 
         # Handle w2_weight
-
         tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
             module.w2_weight.data, tmp_w2_weight_scale)
 
