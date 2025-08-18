@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import \
@@ -336,6 +337,7 @@ class ChatMessage(OpenAIBaseModel):
     role: str
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    reasoning: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
 
@@ -376,8 +378,14 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     """
 
 
+class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
+    """A message from the assistant that includes reasoning."""
+    reasoning: Optional[str]
+
+
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
-                                   CustomChatCompletionMessageParam]
+                                   CustomChatCompletionMessageParam,
+                                   ReasoningAssistantMessage]
 
 
 class ChatCompletionLogProbs(OpenAIBaseModel):
@@ -606,16 +614,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError("stream_options can only be set if stream is true")
         return values
 
-    # @model_validator(mode="before")
-    # @classmethod
-    # def check_tool_choice(cls, data):
-    #     if "tool_choice" in data and data["tool_choice"] != "none":
-    #         if not isinstance(data["tool_choice"], dict):
-    #             raise ValueError("Currently only named tools are supported.")
-    #         if "tools" not in data or data["tools"] is None:
-    #             raise ValueError(
-    #                 "When using `tool_choice`, `tools` must be set.")
-    #     return data
+    @model_validator(mode="before")
+    @classmethod
+    def check_tool_choice(cls, data):
+        if "tool_choice" not in data and data.get("tools"):
+            data["tool_choice"] = "auto"
+        if "tool_choice" in data and data["tool_choice"] != "none":
+            if "tools" not in data or data["tools"] is None:
+                raise ValueError(
+                    "When using `tool_choice`, `tools` must be set.")
+        return data
 
     @model_validator(mode="before")
     @classmethod

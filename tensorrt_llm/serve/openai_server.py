@@ -377,6 +377,8 @@ class OpenAIServer:
         # try:
         #     # 1. RAW INPUT REQUEST (before harmony adapter)
         #     # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
+        # print("Run chat_harmony\n")
+        # print(f"request\n\n{request}\n")
         tools_dict = None
         if request.tools:
             tools_dict = [tool.model_dump() for tool in request.tools]
@@ -556,9 +558,11 @@ class OpenAIServer:
             else:
                 tools_for_parser = tools_dict
 
-            parsed_output = self.harmony_adapter.harmony_output_to_openai(
+            parsed_output, tool_call_parsing_failed = self.harmony_adapter.harmony_output_to_openai(
                 final_res.outputs[0].token_ids, tools_for_parser, tool_choice
             )
+            if tool_call_parsing_failed:
+                print(f"request\n\n{request}")
 
             # 4. CONVERTED OUTPUT (after harmony to openai conversion)
             logger.debug("✅ CONVERTED OUTPUT: %s", json.dumps(parsed_output, indent=2))
@@ -569,7 +573,6 @@ class OpenAIServer:
 
             # Create response message
             response_message = self._create_response_message(parsed_output)
-            print(f"non-streaming response message: {response_message}")
 
             # Determine finish reason
             finish_reason = self._determine_finish_reason(parsed_output)
@@ -589,6 +592,8 @@ class OpenAIServer:
                 }],
                 usage=usage_info,
             )
+            if tool_call_parsing_failed:
+                print(f"response\n\n{response}\n")
 
             return response
 
@@ -611,6 +616,7 @@ class OpenAIServer:
         # Add reasoning_content if present
         if "reasoning_content" in parsed_output:
             message["reasoning_content"] = parsed_output["reasoning_content"]
+            message["reasoning"] = parsed_output["reasoning_content"]
 
         return message
 

@@ -18,7 +18,6 @@ TODO: Partner noted harmony repo is under constant construction - monitor for fu
 """
 
 import json
-import logging
 import re
 import time
 import uuid
@@ -30,11 +29,11 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             SystemContent, TextContent, ToolDescription,
                             load_harmony_encoding)
 
+from tensorrt_llm.logger import logger
+
 from .openai_protocol import (ChatCompletionResponseStreamChoice,
                               ChatCompletionStreamResponse, DeltaMessage,
                               FunctionCall, ToolCall)
-
-logger = logging.getLogger(__name__)
 
 
 class HarmonyStreamState:
@@ -550,6 +549,11 @@ class HarmonyAdapter:
                         Role.USER, msg.get("content", ""))
                     harmony_messages.append(user_msg)
                 elif role == "assistant":
+                    if reasoning := msg.get("reasoning", None):
+                        # If reasoning content is present, use it as the main content
+                        cot_message = Message.from_role_and_content(
+                            Role.ASSISTANT, reasoning).with_channel("analysis")
+                        harmony_messages.append(cot_message)
                     assistant_messages = self._convert_assistant_message_from_openai_to_harmony(
                         msg, external_tools, should_filter_external_tools)
                     harmony_messages.extend(assistant_messages)
@@ -583,6 +587,7 @@ class HarmonyAdapter:
                     logger.warning(f"Unknown message role: {role}")
 
             conversation = Conversation.from_messages(harmony_messages)
+            # print(f"conversation\n\n{conversation}\n")
             # print("================================================")
             # print("openai_messages")
             # print(openai_messages)
@@ -676,7 +681,7 @@ class HarmonyAdapter:
             self,
             harmony_output_tokens: List[int],
             available_tools: Optional[List[Dict[str, Any]]] = None,
-            tool_choice: Optional[str] = None) -> Dict[str, Any]:
+            tool_choice: Optional[str] = None) -> tuple[Dict[str, Any], bool]:
         """
         Parse Harmony model output tokens and convert to OpenAI API response format. Non-streaming.
         Returns a single message dict.
@@ -689,7 +694,7 @@ class HarmonyAdapter:
                 "content":
                 self._safe_decode_utf8(harmony_output_tokens,
                                        "HARMONY_OUTPUT: ")
-            }
+            }, False
 
         # Extract available external tool names and set filtering behavior
         external_tools = set()
@@ -750,6 +755,7 @@ class HarmonyAdapter:
             commentary_preambles = []
             tool_calls = []
             final_content = ""
+            tool_call_parsing_failed = False
 
             for msg in harmony_messages:
                 msg_channel = getattr(msg, 'channel', None)
@@ -780,9 +786,11 @@ class HarmonyAdapter:
                             tool_calls.append(tool_call)
                             # print(f"DEBUG: Added tool call to list")
                         else:
+                            tool_call_parsing_failed = True
                             print(
                                 f"DEBUG: Tool call not allowed or invalid - tool_call={tool_call}, external_tools={external_tools}"
                             )
+                            print(f"DEBUG: message: {msg}")
                     else:
                         # print(f"DEBUG: Commentary preamble - recipient={msg_recipient}")
                         # Preamble
@@ -820,7 +828,7 @@ class HarmonyAdapter:
                 analysis_content, commentary_preambles, tool_calls,
                 final_content)
 
-            return result
+            return result, tool_call_parsing_failed
 
         except Exception as e:
             logger.warning("Failed to parse harmony output: %s. Raw output: %s",
@@ -843,7 +851,7 @@ class HarmonyAdapter:
                 "content": fallback_content,
                 "_harmony_parsing_failed":
                 True  # Internal flag to indicate harmony parsing failed
-            }
+            }, False
 
     def get_stop_tokens(self) -> List[int]:
         """
@@ -1561,12 +1569,6 @@ class HarmonyAdapter:
             .with_knowledge_cutoff("2024-06")\
             .with_conversation_start_date(time.strftime("%Y-%m-%d"))\
             .with_required_channels(["analysis", "commentary", "final"])
-        # return SystemContent.new()\
-        #     .with_model_identity("You are ChatGPT, a large language model trained by OpenAI.")\
-        #     .with_reasoning_effort(self._reasoning_effort_map.get(effort, ReasoningEffort.HIGH))\
-        #     .with_knowledge_cutoff("2024-06")\
-        #     .with_conversation_start_date("2025-07-13")\
-        #     .with_required_channels(["analysis", "commentary", "final"])
 
     # def _create_developer_instructions(self, system_instructions: List[str], available_tools: Optional[List[Dict[str, Any]]] = None) -> str:
     #     """Create developer instructions with system messages and tool definitions."""
@@ -1670,11 +1672,10 @@ class HarmonyAdapter:
         """Parse tool call from harmony message."""
         msg_recipient = getattr(msg, 'recipient', None)
         msg_content = getattr(msg, 'content', [])
+        msg_content_type = getattr(msg, 'content_type', None)
 
         if not msg_recipient or msg_recipient == "assistant":
             return None
-
-        function_name = str(msg_recipient).split("functions.")[-1]
 
         # # Clean up function name by removing constraint tokens that may be incorrectly included
         # # The harmony library sometimes includes ><|constrain|>json in the recipient
@@ -1682,29 +1683,47 @@ class HarmonyAdapter:
         #     function_name = function_name.split(">")[0]
 
         # Extract arguments from message content
-        arguments_json = ""
+        function_call_args = ""
         for content in msg_content:
             if isinstance(content, TextContent):
-                arguments_json += content.text
+                function_call_args += content.text
             elif hasattr(content, 'text'):
-                arguments_json += content.text
+                function_call_args += content.text
             else:
-                arguments_json += str(content)
+                function_call_args += str(content)
 
-        try:
-            # Validate JSON
-            json.loads(arguments_json)
+        if msg_content_type and "<|constrain|>json" in msg_content_type:
+            try:
+                function_name = str(msg_recipient).split("functions.")[-1]
+                # Validate JSON
+                json.loads(function_call_args)
+                return {
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": function_name,
+                        "arguments": function_call_args
+                    }
+                }
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Failed to parse tool call arguments as JSON: %s",
+                    function_call_args)
+                return None
+        elif msg_content_type and "code" in msg_content_type:
+            function_name = str(msg_recipient)
             return {
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
                 "function": {
                     "name": function_name,
-                    "arguments": arguments_json
+                    "arguments": function_call_args
                 }
             }
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse tool call arguments as JSON: %s",
-                           arguments_json)
+        else:
+            logger.warning(
+                f"Unsupported message content type for tool call: {msg_content_type}"
+            )
             return None
 
     def _is_tool_call_allowed(self, tool_call: Dict[str, Any],
@@ -1712,6 +1731,10 @@ class HarmonyAdapter:
                               should_filter_external_tools: bool) -> bool:
         """Check if tool call is allowed based on availability and suppression settings."""
         function_name = tool_call.get("function", {}).get("name", "")
+        # Built-in tools would be called occasionally,
+        # they need to be allowed or empty response will be returned
+        if function_name == "python" or "browser" in function_name or "container" in function_name:
+            return True
 
         # Filter unavailable external tools
         if should_filter_external_tools and function_name not in available_tools:
