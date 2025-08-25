@@ -2487,7 +2487,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
-    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+    MODEL_PATH = f"openai/gpt-oss-120b"
 
     def update_task_kwargs(self, task):
         task.EVALUATOR_KWARGS["fewshot_as_multiturn"] = True
@@ -2527,11 +2527,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (1, 1, 1, False, True, True),
+            (2, 1, 1, False, True, True),
             (4, 1, 1, False, True, True),
+            (8, 1, 1, False, True, True),
             (4, 1, 4, False, True, True),
             (4, 1, 4, True, True, True),
         ],
-        ids=["tp4", "ep4", "dp4"])
+        ids=["tp1","tp2","tp4" ,"tp8","ep4", "dp4"])
     def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
                       attention_dp, cuda_graph, overlap_scheduler):
         if moe_backend == "TRITON":
@@ -2553,7 +2556,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   kv_cache_config=self.kv_cache_config,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
-                  moe_config=MoeConfig(backend=moe_backend))
+                  moe_config=MoeConfig(backend=moe_backend) ,max_batch_size=128)
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
