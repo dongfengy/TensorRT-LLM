@@ -48,6 +48,7 @@ class FP4BlockScaleMoEInputs:
     hidden_states_scale: torch.Tensor
     gemm1_weights: torch.Tensor
     gemm1_weights_scale: torch.Tensor
+    gemm1_bias: torch.Tensor
     gemm1_alpha: torch.Tensor
     gemm1_beta: torch.Tensor
     gemm1_clamp_limit: torch.Tensor
@@ -124,8 +125,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.hidden_states_scale, args.gemm1_weights,
-            args.gemm1_weights_scale, args.gemm1_alpha, args.gemm1_beta,
-            args.gemm1_clamp_limit, args.gemm2_weights,
+            args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
+            args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
             args.gemm2_weights_scale, args.output1_scale_scalar,
             args.output1_scale_gate_scalar, args.output2_scale_scalar,
             self.num_experts, self.top_k, self.n_group, self.topk_group,
@@ -240,6 +241,7 @@ def fp4_block_scale_moe_runner(
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: torch.Tensor,
         gemm1_alpha: torch.Tensor,
         gemm1_beta: torch.Tensor,
         gemm1_clamp_limit: torch.Tensor,
@@ -291,6 +293,7 @@ def fp4_block_scale_moe_runner(
         hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
+        gemm1_bias,
         gemm1_alpha,
         gemm1_beta,
         gemm1_clamp_limit,
@@ -348,6 +351,10 @@ def _(routing_logits,
       hidden_states_scale,
       gemm1_weights,
       gemm1_weights_scale,
+      gemm1_bias,
+      gemm1_alpha,
+      gemm1_beta,
+      gemm1_clamp_limit,
       gemm2_weights,
       gemm2_weights_scale,
       output1_scale_scalar,
