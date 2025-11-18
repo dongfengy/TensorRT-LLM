@@ -2031,16 +2031,11 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         # w3
         dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
             dim=0, start=0, length=module.intermediate_size_per_partition)
-        '''
         print("trying to load w3 scale")
         print("the dtype expected by MOE module is", dst_w3_weight_scale.dtype)
         print("the shape expected by MOE module is", dst_w3_weight_scale.shape)
         print("the dtype of actual w3 shard is", w3_weight_scale.dtype)
         print("the shape of actual w3 shard is", w3_weight_scale.shape)
-        WAR: The checkpoint has block scaling in the wrong dim.
-        This is to make sure the weights load. The accuracy won't be good until we fix the checkpoint.
-        '''
-        w3_weight_scale = w3_weight_scale.transpose(0, 1).contiguous()
         dst_w3_weight_scale.copy_(
             w3_weight_scale.view(dst_w3_weight_scale.dtype))
 
@@ -2049,8 +2044,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             dim=0,
             start=module.intermediate_size_per_partition,
             length=module.intermediate_size_per_partition)
-        # WAR same as above
-        w1_weight_scale = w1_weight_scale.transpose(0, 1).contiguous()
         dst_w1_weight_scale.copy_(
             w1_weight_scale.view(dst_w1_weight_scale.dtype))
 
@@ -2099,8 +2092,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                             TensorParallelMode.ROW,
                                             device=device)
         # Keep weights in device buffer
-        # WAR as above
-        w2_weight_scale = w2_weight_scale.transpose(0, 1).contiguous()
         dst_w2_weight_scale_gpu.copy_(
             w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
 
