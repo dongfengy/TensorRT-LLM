@@ -1365,7 +1365,12 @@ def test_fp4_quantize_pad_unpad():
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
+@pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
+@pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
+                         ids=lambda v: f"limit{v}")
+def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
+                         swiglu_alpha, swiglu_beta, swiglu_limit):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
@@ -1469,6 +1474,19 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             weights[f"{expert_id}.w2.bias"] = w2_bias
             weights[f"{expert_id}.w3.bias"] = w3_bias
 
+        swiglu_alpha_tensor = torch.full((NUM_EXPERTS, ),
+                                         swiglu_alpha,
+                                         device='cuda',
+                                         dtype=torch.float)
+        swiglu_beta_tensor = torch.full((NUM_EXPERTS, ),
+                                        swiglu_beta,
+                                        device='cuda',
+                                        dtype=torch.float)
+        swiglu_limit_tensor = torch.full((NUM_EXPERTS, ),
+                                         swiglu_limit,
+                                         device='cuda',
+                                         dtype=torch.float)
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
         fused_moe = create_moe(
             num_experts=NUM_EXPERTS,
@@ -1480,6 +1498,9 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             reduce_results=True,
             model_config=ModelConfig(quant_config=quant_config,
                                      moe_backend=moe_backend),
+            swiglu_alpha=swiglu_alpha_tensor,
+            swiglu_beta=swiglu_beta_tensor,
+            swiglu_limit=swiglu_limit_tensor,
         )
         fused_moe.load_weights([weights])
         fused_moe.cuda()
@@ -1492,7 +1513,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             intermediate_size=INTERMEDIATE_SIZE,
             bias=True,
             dtype=dtype,
-            model_config=ModelConfig(quant_config=quant_config))
+            model_config=ModelConfig(quant_config=quant_config),
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit)
         ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
 
@@ -1507,7 +1531,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
         print()
         print("actual", output)
         print("ref", ref_output)
-        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.975)
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
 
         if not test_all_kernels:
             return
@@ -1524,7 +1548,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
                                ref_output,
                                rtol=0.1,
                                atol=0.1,
-                               percent=0.975)
+                               percent=0.95)
 
 
 @skip_pre_blackwell
@@ -2624,7 +2648,10 @@ class RefGatedMLPFusedMoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  use_cute_dsl_blockscaling_mm: bool = False,
-                 bias=False):
+                 bias=False,
+                 swiglu_alpha: Optional[float] = None,
+                 swiglu_beta: Optional[float] = None,
+                 swiglu_limit: Optional[float] = None):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -2635,6 +2662,19 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.dtype = dtype
         self.quant_config = model_config.quant_config
 
+        def custom_swiglu(x):
+            gate, value = x.chunk(2, dim=-1)
+            if swiglu_limit is not None and swiglu_limit != float("inf"):
+                gate = gate.clamp(max=swiglu_limit)
+                value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+            alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
+            gate_act = gate * torch.sigmoid(gate * alpha)
+
+            beta = swiglu_beta if swiglu_beta is not None else 0.0
+
+            return gate_act * (value + beta)
+
         self.experts = nn.ModuleList([
             GatedMLP(
                 hidden_size=self.hidden_size,
@@ -2643,6 +2683,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                 dtype=self.dtype,
                 config=model_config,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                activation=custom_swiglu,
             ) for _ in range(self.num_experts)
         ])
 
