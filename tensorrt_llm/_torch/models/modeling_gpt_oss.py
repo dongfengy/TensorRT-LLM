@@ -557,15 +557,15 @@ class MLPBlock(torch.nn.Module):
 
         # When attention_dp is not enabled, don't pass those parameters
         if os.environ.get('USE_REF_FUSED_MOE', '0') == '1':
-            print("Using reference MoE forward")
+            #print("Using reference MoE forward")
             expert_output = self.experts_ref(hidden_states=t, router_logits=g)
             expert_output_gen = None  # self.experts(x=t, router_logits=g)
-            print("ref", expert_output)
-            print("gen", expert_output_gen)
+            #print("ref", expert_output)
+            #print("gen", expert_output_gen)
         else:
-            print("Using original MoE forward")
+            #print("Using original MoE forward")
             expert_output = self.experts(x=t, router_logits=g)
-            print("gen", expert_output)
+            #print("gen", expert_output)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
@@ -1098,17 +1098,6 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 down = module_weights.get('down_proj', None)
                 gate_up_bias = module_weights.get('gate_up_proj_bias', None)
                 down_bias = module_weights.get('down_proj_bias', None)
-
-                # Optional deinterleave for checkpoints that interleave gate/up
-                if gate_up is not None and gate_up.dim() == 3:
-                    try:
-                        g, u = gate_up[:, :, ::2], gate_up[:, :, 1::2]
-                        gate_up = torch.cat([g, u], dim=-1)
-                        if gate_up_bias is not None:
-                            gb, ub = gate_up_bias[:, ::2], gate_up_bias[:, 1::2]
-                            gate_up_bias = torch.cat([gb, ub], dim=-1)
-                    except Exception:
-                        pass
 
                 # Only fp32 bias is supported for NVFP4 MoE.
                 if gate_up_bias.dtype != torch.float32:
