@@ -9,6 +9,7 @@ from transformers import GptOssConfig
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -29,6 +30,13 @@ from ..modules.fused_moe.routing import (get_cached_perfect_router_logits,
                                          precompute_common_perfect_router_logits
                                          )
 # isort: on
+from typing import Dict, List, Optional
+
+from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
+                                                   RenormalizeMoeRoutingMethod,
+                                                   TritonFusedMoE, create_moe)
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -126,6 +134,273 @@ class AttentionBlock(Attention):
         self.sinks.data = sinks.to(torch.float32).to("cuda")
 
 
+def _is_ref_moe_module(module: nn.Module) -> bool:
+    """Returns True when module is the reference MoE wrapper itself or one of its children."""
+    if isinstance(module, RefGatedMLPFusedMoE):
+        return True
+    parent = getattr(module, "_ref_moe_parent", None)
+    return parent is not None
+
+
+class RefGatedMLPFusedMoE(nn.Module):
+
+    def __init__(
+        self,
+        num_experts: int,
+        routing_method: BaseMoeRoutingMethod,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config: ModelConfig = ModelConfig(),
+        use_cute_dsl_blockscaling_mm: bool = False,
+        bias=False,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.routing_method = routing_method
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.bias = bias
+
+        self.dtype = dtype
+        self.quant_config = model_config.quant_config
+        self.weight_loading_mode = weight_loading_mode
+
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
+
+        def custom_swiglu(x, expert_idx: int = 0):
+            gate, value = x.chunk(2, dim=-1)
+            if swiglu_limit[expert_idx] is not None and swiglu_limit[
+                    expert_idx] != float("inf"):
+                gate = gate.clamp(max=swiglu_limit[expert_idx])
+                value = value.clamp(min=-swiglu_limit[expert_idx],
+                                    max=swiglu_limit[expert_idx])
+
+            alpha = swiglu_alpha[expert_idx] if swiglu_alpha[
+                expert_idx] is not None else 1.0
+            gate_act = gate * torch.sigmoid(gate * alpha)
+
+            beta = swiglu_beta[expert_idx] if swiglu_beta[
+                expert_idx] is not None else 0.0
+
+            return gate_act * (value + beta)
+
+        self.experts = nn.ModuleList([
+            GatedMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                bias=bias,
+                dtype=self.dtype,
+                config=model_config,
+                use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                activation=lambda x: custom_swiglu(x, expert_idx=expert_idx),
+            ) for expert_idx in range(self.num_experts)
+        ])
+
+    def _get_expert_entry(self, container, expert_idx: int):
+        if container is None:
+            return None
+        if isinstance(container, dict):
+            return container.get(expert_idx)
+        if isinstance(container, (list, tuple)):
+            return container[expert_idx]
+        if torch.is_tensor(container):
+            if container.dim() == 0:
+                return container
+            return container[expert_idx]
+        raise TypeError(f"Unsupported container type for expert weights: "
+                        f"{type(container)}")
+
+    def _expand_fused_gate_up_weights(self, weights: Dict) -> Dict:
+        if self.weight_loading_mode != MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+            assert self.weight_loading_mode == MoEWeightLoadingMode.VANILLA
+            return weights
+
+        required = ["gate_up_proj", "down_proj"]
+        for key in required:
+            if key not in weights:
+                raise KeyError(
+                    f"Missing required key '{key}' for fused gate-up weights.")
+
+        expanded = dict(weights)
+        gate_up_scales = weights.get("gate_up_proj_weight_scale")
+        down_scales = weights.get("down_proj_weight_scale")
+
+        for expert in range(self.num_experts):
+            fused_gate = self._get_expert_entry(weights["gate_up_proj"], expert)
+            if fused_gate is None:
+                raise KeyError(
+                    f"Missing fused gate_up_proj entry for expert {expert}")
+            fused_gate = fused_gate.transpose(0, 1).contiguous()
+            w1_weight, w3_weight = fused_gate.chunk(2, dim=0)
+            expanded[f"{expert}.w1.weight"] = w1_weight
+            expanded[f"{expert}.w3.weight"] = w3_weight
+
+            fused_bias = self._get_expert_entry(
+                weights.get("gate_up_proj.bias"), expert)
+            if fused_bias is not None:
+                w1_bias, w3_bias = fused_bias.chunk(2, dim=0)
+                expanded[f"{expert}.w1.bias"] = w1_bias
+                expanded[f"{expert}.w3.bias"] = w3_bias
+
+            fused_scale = (self._get_expert_entry(gate_up_scales, expert)
+                           if gate_up_scales is not None else None)
+            if fused_scale is not None:
+                fused_scale = fused_scale.transpose(0, 1).contiguous()
+                w1_scale, w3_scale = fused_scale.chunk(2, dim=0)
+                expanded[f"{expert}.w1.weight_scale"] = w1_scale
+                expanded[f"{expert}.w3.weight_scale"] = w3_scale
+
+            down_weight = self._get_expert_entry(weights["down_proj"], expert)
+            down_weight = down_weight.transpose(0, 1).contiguous()
+            expanded[f"{expert}.w2.weight"] = down_weight
+
+            down_bias = self._get_expert_entry(weights.get("down_proj.bias"),
+                                               expert)
+            if down_bias is not None:
+                expanded[f"{expert}.w2.bias"] = down_bias
+
+            down_scale = (self._get_expert_entry(down_scales, expert)
+                          if down_scales is not None else None)
+            if down_scale is not None:
+                expanded[f"{expert}.w2.weight_scale"] = down_scale.transpose(
+                    0, 1).contiguous()
+
+            if "gate_up_proj_weight_scale_2" in weights:
+                expanded[f"{expert}.w1.weight_scale_2"] = weights[
+                    "gate_up_proj_weight_scale_2"]
+                expanded[f"{expert}.w3.weight_scale_2"] = weights[
+                    "gate_up_proj_weight_scale_2"]
+            if "down_proj_weight_scale_2" in weights:
+                expanded[f"{expert}.w2.weight_scale_2"] = weights[
+                    "down_proj_weight_scale_2"]
+
+            if "gate_up_proj_input_scale" in weights:
+                expanded[f"{expert}.w1.input_scale"] = weights[
+                    "gate_up_proj_input_scale"]
+                expanded[f"{expert}.w3.input_scale"] = weights[
+                    "gate_up_proj_input_scale"]
+            if "down_proj_input_scale" in weights:
+                expanded[f"{expert}.w2.input_scale"] = weights[
+                    "down_proj_input_scale"]
+
+        return expanded
+
+    def forward(self, hidden_states: torch.Tensor,
+                router_logits: torch.Tensor) -> torch.Tensor:
+        assert hidden_states.shape[-1] == self.hidden_size
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+
+        selected_experts, routing_weights = self.routing_method.apply(
+            router_logits)
+
+        final_hidden_states = torch.zeros(hidden_states.shape,
+                                          dtype=hidden_states.dtype,
+                                          device=hidden_states.device)
+
+        for expert_id in range(self.num_experts):
+            if not torch.any(selected_experts == expert_id):
+                continue
+            batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+            expert_inputs = hidden_states[batch_idx]
+
+            output = self.experts[expert_id](expert_inputs)
+            final_hidden_states[batch_idx] += routing_weights[
+                batch_idx, nth_expert, None] * output.float()
+
+        final_hidden_states = final_hidden_states.reshape(hidden_states.shape)
+        return final_hidden_states
+
+    def load_weights(self, weights: List[Dict]):
+        assert len(weights) == 1
+        weights = self._expand_fused_gate_up_weights(weights[0])
+        print("hello alpha:", self.swiglu_alpha)
+        print("hello beta:", self.swiglu_beta)
+        print("hello limit:", self.swiglu_limit)
+
+        for expert in range(self.num_experts):
+            gate_up_proj_weights = [{}, {}]
+            down_proj_weights = [{}]
+
+            gate_up_proj_weights[0]['weight'] = weights[f"{expert}.w1.weight"]
+            gate_up_proj_weights[1]['weight'] = weights[f"{expert}.w3.weight"]
+            down_proj_weights[0]['weight'] = weights[f"{expert}.w2.weight"]
+            print("hello w1 weight:", gate_up_proj_weights[0]['weight'])
+            print("hello w3 weight:", gate_up_proj_weights[1]['weight'])
+            print("hello w2 weight:", down_proj_weights[0]['weight'])
+            if self.bias:
+                gate_up_proj_weights[0]['bias'] = weights[f"{expert}.w1.bias"]
+                gate_up_proj_weights[1]['bias'] = weights[f"{expert}.w3.bias"]
+                down_proj_weights[0]['bias'] = weights[f"{expert}.w2.bias"]
+                print("hello w1 bias:", gate_up_proj_weights[0]['bias'])
+                print("hello w3 bias:", gate_up_proj_weights[1]['bias'])
+                print("hello w2 bias:", down_proj_weights[0]['bias'])
+
+            if self.quant_config and self.quant_config.quant_algo == QuantAlgo.FP8:
+                gate_up_proj_weights[0]['weight_scale'] = weights[
+                    f"{expert}.w1.weight_scale"]
+                gate_up_proj_weights[1]['weight_scale'] = weights[
+                    f"{expert}.w3.weight_scale"]
+                down_proj_weights[0]['weight_scale'] = weights[
+                    f"{expert}.w2.weight_scale"]
+                gate_up_proj_weights[0]['input_scale'] = weights[
+                    f"{expert}.w1.input_scale"]
+                gate_up_proj_weights[1]['input_scale'] = weights[
+                    f"{expert}.w3.input_scale"]
+                down_proj_weights[0]['input_scale'] = weights[
+                    f"{expert}.w2.input_scale"]
+            elif self.quant_config and self.quant_config.quant_algo in (
+                    QuantAlgo.NVFP4, QuantAlgo.W4A8_NVFP4_FP8):
+                gate_up_proj_weights[0]['weight_scale'] = weights[
+                    f"{expert}.w1.weight_scale"]
+                gate_up_proj_weights[1]['weight_scale'] = weights[
+                    f"{expert}.w3.weight_scale"]
+                down_proj_weights[0]['weight_scale'] = weights[
+                    f"{expert}.w2.weight_scale"]
+                gate_up_proj_weights[0]['input_scale'] = weights[
+                    f"{expert}.w1.input_scale"]
+                gate_up_proj_weights[1]['input_scale'] = weights[
+                    f"{expert}.w3.input_scale"]
+                down_proj_weights[0]['input_scale'] = weights[
+                    f"{expert}.w2.input_scale"]
+                gate_up_proj_weights[0]['weight_scale_2'] = weights[
+                    f"{expert}.w1.weight_scale_2"]
+                gate_up_proj_weights[1]['weight_scale_2'] = weights[
+                    f"{expert}.w3.weight_scale_2"]
+                down_proj_weights[0]['weight_scale_2'] = weights[
+                    f"{expert}.w2.weight_scale_2"]
+                print("hello w1 weight_scale_2:",
+                      gate_up_proj_weights[0]['weight_scale_2'])
+                print("hello w3 weight_scale_2:",
+                      gate_up_proj_weights[1]['weight_scale_2'])
+                print("hello w2 weight_scale_2:",
+                      down_proj_weights[0]['weight_scale_2'])
+            elif (self.quant_config and self.quant_config.quant_algo
+                  == QuantAlgo.FP8_BLOCK_SCALES):
+                gate_up_proj_weights[0]["weight_scale"] = weights[
+                    f"{expert}.w1.weight_scale"]
+                gate_up_proj_weights[1]["weight_scale"] = weights[
+                    f"{expert}.w3.weight_scale"]
+                down_proj_weights[0]["weight_scale"] = weights[
+                    f"{expert}.w2.weight_scale"]
+            elif self.quant_config and self.quant_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+                gate_up_proj_weights[0]['weight_scale'] = weights[
+                    f"{expert}.w1.weight_scale"]
+                gate_up_proj_weights[1]['weight_scale'] = weights[
+                    f"{expert}.w3.weight_scale"]
+                down_proj_weights[0]['weight_scale'] = weights[
+                    f"{expert}.w2.weight_scale"]
+
+            self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
+            self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+
 class MLPBlock(torch.nn.Module):
 
     def __init__(
@@ -189,7 +464,27 @@ class MLPBlock(torch.nn.Module):
             'swiglu_limit': self.swiglu_limit
         }
 
+        use_ref_fused_moe = os.environ.get('USE_REF_FUSED_MOE', '0') == '1'
+
         self.experts = create_moe(**moe_params)
+        if not use_ref_fused_moe:
+            print("Using original moe")
+        else:
+            print("Using reference moe")
+
+            moe_params_ref = dict(moe_params)
+            reduce_results_flag = moe_params_ref.pop('reduce_results')
+            assert reduce_results_flag, (
+                "RefGatedMLPFusedMoE only supports reduce_results=True. "
+                "Set reduce_results to True before enabling USE_REF_FUSED_MOE.")
+
+            ref_moe = RefGatedMLPFusedMoE(**moe_params_ref)
+            # mark children so weight loader can skip descending into them
+            setattr(ref_moe, "_ref_moe_parent", 1)
+            for child in ref_moe.modules():
+                setattr(child, "_ref_moe_parent", 1)
+            self.experts_ref = ref_moe
+            setattr(self.experts, "my_ref", ref_moe)
 
         # Perfect router caching - precompute common logits if enabled
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
@@ -261,7 +556,16 @@ class MLPBlock(torch.nn.Module):
                 num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
         # When attention_dp is not enabled, don't pass those parameters
-        expert_output = self.experts(x=t, router_logits=g)
+        if os.environ.get('USE_REF_FUSED_MOE', '0') == '1':
+            print("Using reference MoE forward")
+            expert_output = self.experts_ref(hidden_states=t, router_logits=g)
+            expert_output_gen = None  # self.experts(x=t, router_logits=g)
+            print("ref", expert_output)
+            print("gen", expert_output_gen)
+        else:
+            print("Using original MoE forward")
+            expert_output = self.experts(x=t, router_logits=g)
+            print("gen", expert_output)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
@@ -787,6 +1091,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             module_weights = filter_weights(name, weights)
 
             if isinstance(module, MoE):
+                print(f"Loading NVFP4 MoE weights for module: {name}")
                 assert getattr(module, "quant_config", None) is not None and \
                    module.quant_config.quant_mode.has_nvfp4()
                 gate_up = module_weights.get('gate_up_proj', None)
@@ -851,7 +1156,15 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                     if src_key in module_weights:
                         moe_weights[src_key] = module_weights[src_key]
 
-                module.load_weights(weights=[moe_weights])
+                print(
+                    "also give the weight to ref moe if exists but don't give to ref moe directly"
+                )
+                if os.environ.get('USE_REF_FUSED_MOE', '0') == '1':
+                    module.my_ref.load_weights(weights=[moe_weights])
+                else:
+                    module.load_weights(weights=[moe_weights])
+            elif _is_ref_moe_module(module):
+                continue
             elif hasattr(module, "load_weights"):
                 if 'qkv' in name:
                     # For qkv_proj
