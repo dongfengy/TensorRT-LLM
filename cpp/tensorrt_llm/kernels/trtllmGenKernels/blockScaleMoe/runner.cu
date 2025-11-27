@@ -259,6 +259,10 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         // tensorrt_llm/_torch/modules/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
         validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
     }
+    if (mDtypeWeights == btg::Dtype::E2m1 && mDtypeAct == btg::Dtype::E2m1)
+    {
+        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 256);
+    }
     auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, numTokens, 2 * validIntermediateSize, validHiddenSize, {},
         numTokens, numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
