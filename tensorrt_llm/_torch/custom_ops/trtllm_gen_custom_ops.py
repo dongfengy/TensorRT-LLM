@@ -169,6 +169,8 @@ class FP4BlockScaleMoEInputs:
     output2_scale_scalar: torch.Tensor
     topk_weights: Optional[torch.Tensor] = None
     topk_ids: Optional[torch.Tensor] = None
+    valid_hidden_size: Optional[int] = None
+    valid_intermediate_size: Optional[int] = None
 
 
 class FP4BlockScaleMoERunner(TunableRunner):
@@ -180,13 +182,17 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
-                 routing_method_type: int, do_finalize: bool):
+                 routing_method_type: int, do_finalize: bool,
+                 valid_hidden_size: Optional[int],
+                 valid_intermediate_size: Optional[int]):
 
         self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
+        self.valid_hidden_size = valid_hidden_size
+        self.valid_intermediate_size = valid_intermediate_size
         self.local_expert_offset = local_expert_offset
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
@@ -243,7 +249,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids)
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids,
+            self.valid_hidden_size, self.valid_intermediate_size)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -381,7 +388,9 @@ def fp4_block_scale_moe_runner(
         routing_method_type: int,
         do_finalize: bool,
         topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+        topk_ids: Optional[torch.Tensor] = None,
+        valid_hidden_size: Optional[int] = None,
+        valid_intermediate_size: Optional[int] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -395,6 +404,8 @@ def fp4_block_scale_moe_runner(
         routed_scaling_factor,
         routing_method_type,
         do_finalize,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -431,6 +442,8 @@ def fp4_block_scale_moe_runner(
         output2_scale_scalar,
         topk_weights_for_tuner,  # Dummy if need_dummy_topk, else actual value
         topk_ids_for_tuner,  # Dummy if need_dummy_topk, else actual value
+        valid_hidden_size,
+        valid_intermediate_size,
     ]
 
     kernel_runner, best_tactic = tuner.choose_one(
@@ -461,6 +474,8 @@ def fp4_block_scale_moe_runner(
         output2_scale_scalar,
         topk_weights,  # Actual value (None for routing, real tensor for attention DP)
         topk_ids,  # Actual value (None for routing, real tensor for attention DP)
+        valid_hidden_size,
+        valid_intermediate_size,
     ]
 
     return kernel_runner(input_tensors,
@@ -521,10 +536,16 @@ def _(routing_logits,
       routing_method_type,
       do_finalize,
       topk_weights: Optional[torch.Tensor] = None,
-      topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+      topk_ids: Optional[torch.Tensor] = None,
+      valid_hidden_size: Optional[int] = None,
+      valid_intermediate_size: Optional[int] = None) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1] * 2
+        # Use valid_hidden_size if provided, otherwise use padded hidden_size * 2 (since it's packed)
+        if valid_hidden_size is not None:
+            hidden_size = valid_hidden_size
+        else:
+            hidden_size = hidden_states.shape[1] * 2
         return [
             hidden_states.new_empty((num_tokens, hidden_size),
                                     dtype=torch.bfloat16)

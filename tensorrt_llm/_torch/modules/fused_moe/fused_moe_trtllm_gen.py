@@ -609,6 +609,8 @@ class TRTLLMGenFusedMoE(MoE):
                 do_finalize=do_finalize,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
+                valid_hidden_size=self.hidden_size,
+                valid_intermediate_size=self.intermediate_size_per_partition,
             )
 
             if not do_finalize:
@@ -616,10 +618,6 @@ class TRTLLMGenFusedMoE(MoE):
                 return outputs
             else:
                 final_hidden_states = outputs[0]
-                if final_hidden_states.shape[-1] != self.hidden_size:
-                    final_hidden_states = final_hidden_states[:, :self.
-                                                              hidden_size].contiguous(
-                                                              )
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
             if not post_quant_comm:

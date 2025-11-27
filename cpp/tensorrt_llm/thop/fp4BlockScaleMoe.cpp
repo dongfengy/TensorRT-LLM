@@ -42,7 +42,9 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
-    torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+    torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+    std::optional<int64_t> const valid_hidden_size = std::nullopt,
+    std::optional<int64_t> const valid_intermediate_size = std::nullopt)
 {
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
@@ -179,6 +181,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
         args.hidden_size = hidden_states.sizes()[1] * 2;
     }
+    args.valid_hidden_size = valid_hidden_size;
     args.top_k = top_k;
     args.n_group = n_group.value_or(0);
     args.topk_group = topk_group.value_or(0);
@@ -186,6 +189,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.local_num_experts = local_num_experts;
     args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args.intermediate_size = intermediate_size;
+    args.valid_intermediate_size = valid_intermediate_size;
 
     // allocate workspace for routing kernel
     if (routing_logits.has_value() && topk_ids.has_value())
@@ -387,8 +391,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     TORCH_CHECK(output2_scales_scalar.sizes()[0] == local_num_experts, "output2_scales_scalar has incorrect dim 0.");
 
     // allocate output
-    at::Tensor output = at::detail::empty_cuda(
-        {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    at::Tensor output = at::detail::empty_cuda({args.num_tokens, args.valid_hidden_size.value_or(args.hidden_size)},
+        at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
@@ -502,7 +506,8 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids)
+        torch::optional<torch::Tensor> const& topk_ids, std::optional<int64_t> const valid_hidden_size = std::nullopt,
+        std::optional<int64_t> const valid_intermediate_size = std::nullopt)
     {
         // moeConfigIndex corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
@@ -527,7 +532,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config,
-            topk_weights, topk_ids);
+            topk_weights, topk_ids, valid_hidden_size, valid_intermediate_size);
     }
 
 private:
