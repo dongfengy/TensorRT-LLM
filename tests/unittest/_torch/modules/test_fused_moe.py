@@ -1593,9 +1593,9 @@ def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
     if enable_configurable_moe == 1 and moe_backend not in [
             "TRTLLM", "CUTLASS"
     ]:
-    pytest.skip(
-        "ENABLE_CONFIGURABLE_MOE=1, only TRTLLM and CUTLASS backend are enabled"
-    )
+        pytest.skip(
+            "ENABLE_CONFIGURABLE_MOE=1, only TRTLLM and CUTLASS backend are enabled"
+        )
 
     mocker.patch.dict(
         os.environ, {
