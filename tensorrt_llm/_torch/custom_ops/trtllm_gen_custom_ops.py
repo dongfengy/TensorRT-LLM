@@ -372,13 +372,13 @@ def fp4_block_scale_moe_runner(
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
-        gemm1_bias: torch.Tensor,
-        gemm1_alpha: torch.Tensor,
-        gemm1_beta: torch.Tensor,
-        gemm1_clamp_limit: torch.Tensor,
+        #gemm1_bias: torch.Tensor,
+        #gemm1_alpha: torch.Tensor,
+        #gemm1_beta: torch.Tensor,
+        #gemm1_clamp_limit: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        gemm2_bias: torch.Tensor,
+        #gemm2_bias: torch.Tensor,
         output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor,
@@ -387,8 +387,8 @@ def fp4_block_scale_moe_runner(
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
-        valid_hidden_size: Optional[int],
-        valid_intermediate_size: Optional[int],
+        #valid_hidden_size: Optional[int],
+        #valid_intermediate_size: Optional[int],
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
@@ -396,6 +396,15 @@ def fp4_block_scale_moe_runner(
         do_finalize: bool,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+
+    
+    gemm1_bias=None
+    gemm1_alpha=None
+    gemm1_beta=None
+    gemm1_clamp_limit=None
+    gemm2_bias=None
+    valid_hidden_size=None
+    valid_intermediate_size=None
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
