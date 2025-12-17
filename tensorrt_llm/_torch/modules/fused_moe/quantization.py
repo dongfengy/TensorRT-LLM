@@ -141,9 +141,9 @@ def trtllmgen_maybe_get_cached_w2_permute_indices(
     return permute_indices
 
 
-def maybe_pad_for_mxfp4(weight: torch.Tensor,
-                        col_alignment: int,
-                        row_alignment: Optional[int] = None) -> torch.Tensor:
+def maybe_pad_for_weights(weight: torch.Tensor,
+                          col_alignment: int,
+                          row_alignment: Optional[int] = None) -> torch.Tensor:
     col_pad_size = (col_alignment - weight.shape[-1]) % col_alignment
     if row_alignment:
         row_pad_size = (row_alignment - weight.shape[-2]) % row_alignment
@@ -218,13 +218,11 @@ class FusedMoEMethodBase(ABC):
 
         # bias
         if module.bias:
+            # The shape might be padded so we use weight shape[:2]
             if w3_w1_bias_shape is None:
-                w3_w1_bias_shape = (module.expert_size_per_partition,
-                                    module.intermediate_size_per_partition *
-                                    module.intermediate_size_expand_ratio)
+                w3_w1_bias_shape = w3_w1_weight_shape[:2]
             if w2_bias_shape is None:
-                w2_bias_shape = (module.expert_size_per_partition,
-                                 module.hidden_size)
+                w2_bias_shape = w2_weight_shape[:2]
             bias_dtype = bias_dtype or module.dtype
             w3_w1_bias = nn.Parameter(torch.empty(w3_w1_bias_shape,
                                                   dtype=bias_dtype),
@@ -1661,25 +1659,40 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        weight_vec_size,
                        block_scales_dtype,
                        block_scales_vec_size,
-                       scaling_vector_size=16):
+                       scaling_vector_size=16,
+                       weight_alignment: int = 1,
+                       input_hidden_alignment: int = 1,
+                       bias_dtype: Optional[torch.dtype] = None):
+
+        def round_up(x, alignment):
+            return (x + alignment - 1) // alignment * alignment
 
         module.scaling_vector_size = scaling_vector_size
+
+        # Compute padded sizes
+        intermediate_size_per_partition_padded = round_up(
+            module.intermediate_size_per_partition, weight_alignment)
+        w3_w1_hidden_size_padded = round_up(module.hidden_size,
+                                            input_hidden_alignment)
+        w2_hidden_size_padded = round_up(module.hidden_size, weight_alignment)
+
         # Divide by 16 because we use int64 to pack 16 fp4 values
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition *
+                              intermediate_size_per_partition_padded *
                               module.intermediate_size_expand_ratio,
-                              module.hidden_size // weight_vec_size)
-        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
-                           module.intermediate_size_per_partition //
+                              w3_w1_hidden_size_padded // weight_vec_size)
+        w2_weight_shape = (module.expert_size_per_partition,
+                           w2_hidden_size_padded,
+                           intermediate_size_per_partition_padded //
                            weight_vec_size)
 
         # Divide by 4 because we use int32 to pack 4 fp8 values
         # column parallel
         w3_w1_weight_scale = nn.Parameter(
             torch.ones(module.expert_size_per_partition,
-                       module.intermediate_size_per_partition *
+                       intermediate_size_per_partition_padded *
                        module.intermediate_size_expand_ratio,
-                       module.hidden_size // module.scaling_vector_size //
+                       w3_w1_hidden_size_padded // module.scaling_vector_size //
                        block_scales_vec_size,
                        dtype=block_scales_dtype),
             requires_grad=False)
@@ -1688,8 +1701,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # row parallel
         w2_weight_scale = nn.Parameter(
             torch.ones(module.expert_size_per_partition,
-                       module.hidden_size,
-                       module.intermediate_size_per_partition //
+                       w2_hidden_size_padded,
+                       intermediate_size_per_partition_padded //
                        module.scaling_vector_size // block_scales_vec_size,
                        dtype=block_scales_dtype),
             requires_grad=False)
@@ -1717,8 +1730,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # This will be initialized in load_quant_scales if pre_quant_scale exists
         module.register_parameter("fc31_act_scale", None)
 
-        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
+        super().create_weights(module,
+                               weight_dtype,
+                               w3_w1_weight_shape,
+                               w2_weight_shape,
+                               bias_dtype=bias_dtype)
 
         self.setup_quant_scales(module)
 
@@ -2125,6 +2141,8 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
+    weight_alignment = 32
+    input_hidden_alignment = 32
 
     # Cache the permute indices during weight loading to avoid recompute
     # This assumes the same input shape always results in the same permute indices
@@ -2134,8 +2152,23 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         block_scales_vec_size = 1
 
-        super().create_weights(module, self.weight_dtype, weight_vec_size,
-                               self.block_scales_dtype, block_scales_vec_size)
+        # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
+        if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
+            self.weight_alignment = 256
+            # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
+            # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
+            self.input_hidden_alignment = 256
+
+        super().create_weights(
+            module,
+            self.weight_dtype,
+            weight_vec_size,
+            self.block_scales_dtype,
+            block_scales_vec_size,
+            scaling_vector_size=16,
+            weight_alignment=self.weight_alignment,
+            input_hidden_alignment=self.input_hidden_alignment,
+            bias_dtype=torch.float32)
 
         fc31_scale_c = nn.Parameter(torch.ones(module.expert_size_per_partition,
                                                dtype=torch.float32),
@@ -2143,6 +2176,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         module.register_parameter("fc31_scale_c", fc31_scale_c)
 
         self.setup_quant_scales(module)
+
+        # Initialize with default value - will be updated in post_load_weights if padding is used
+        self.intermediate_size_per_partition_lean = module.intermediate_size_per_partition
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
@@ -2629,19 +2665,19 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             # Pad weights
             # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
             assert w1_weight.dtype == torch.uint8
-            w1_weight = maybe_pad_for_mxfp4(w1_weight,
+            w1_weight = maybe_pad_for_weights(w1_weight,
                                             self.weight_alignment // 2,
                                             alignment)
             assert w3_weight.dtype == torch.uint8
-            w3_weight = maybe_pad_for_mxfp4(w3_weight,
+            w3_weight = maybe_pad_for_weights(w3_weight,
                                             self.weight_alignment // 2,
                                             alignment)
         else:
             # Pad bias.
             assert len(w1_weight.shape) == 1
             assert len(w3_weight.shape) == 1
-            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment)
-            w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment)
+            w1_weight = maybe_pad_for_weights(w1_weight, alignment)
+            w3_weight = maybe_pad_for_weights(w3_weight, alignment)
 
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
@@ -2670,12 +2706,12 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         if len(w2_weight.shape) == 2:
             assert w2_weight.dtype == torch.uint8
-            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
+            w2_weight = maybe_pad_for_weights(w2_weight, alignment // 2,
                                             self.weight_alignment)
         else:
             # Pad bias.
             assert len(w2_weight.shape) == 1
-            w2_weight = maybe_pad_for_mxfp4(w2_weight, self.weight_alignment)
+            w2_weight = maybe_pad_for_weights(w2_weight, self.weight_alignment)
 
         w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
                                             module.tp_rank,
@@ -2695,10 +2731,10 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           module.tp_size,
                                           w3_weight_scale.shape[0])
 
-        w1_weight_scale = maybe_pad_for_mxfp4(
+        w1_weight_scale = maybe_pad_for_weights(
             w1_weight_scale,
             self.weight_alignment // module.scaling_vector_size, alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
+        w3_weight_scale = maybe_pad_for_weights(
             w3_weight_scale,
             self.weight_alignment // module.scaling_vector_size, alignment)
 
@@ -2738,7 +2774,7 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           module.tp_size,
                                           w2_weight_scale.shape[-1])
 
-        w2_weight_scale = maybe_pad_for_mxfp4(
+        w2_weight_scale = maybe_pad_for_weights(
             w2_weight_scale, alignment // module.scaling_vector_size,
             self.weight_alignment)
 
@@ -2921,7 +2957,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           module.scaling_vector_size,
                                           module.tp_size, w1_weight.shape[0])
         # Pad the proxy weight
-        w1_weight = maybe_pad_for_mxfp4(w1_weight, self.input_hidden_alignment,
+        w1_weight = maybe_pad_for_weights(w1_weight, self.input_hidden_alignment,
                                         alignment)
         # Get the slice range of each tp rank
         _, w1_weight_shard_slice = load_weight_shard(w1_weight,
@@ -2974,19 +3010,19 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             # Pad weights
             # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
             assert w1_weight.dtype == torch.uint8
-            w1_weight = maybe_pad_for_mxfp4(w1_weight,
+            w1_weight = maybe_pad_for_weights(w1_weight,
                                             self.input_hidden_alignment // 2,
                                             alignment)
             assert w3_weight.dtype == torch.uint8
-            w3_weight = maybe_pad_for_mxfp4(w3_weight,
+            w3_weight = maybe_pad_for_weights(w3_weight,
                                             self.input_hidden_alignment // 2,
                                             alignment)
         else:
             # Pad bias, TRTLLM backend expects float32 bias.
             assert len(w1_weight.shape) == 1
             assert len(w3_weight.shape) == 1
-            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
-            w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
+            w1_weight = maybe_pad_for_weights(w1_weight, alignment).float()
+            w3_weight = maybe_pad_for_weights(w3_weight, alignment).float()
 
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
@@ -3033,14 +3069,14 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         if len(w2_weight.shape) == 2:
             assert w2_weight.dtype == torch.uint8
-            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
+            w2_weight = maybe_pad_for_weights(w2_weight, alignment // 2,
                                             self.weight_alignment)
         else:
             # Pad bias, TRTLLM backend expects float32 bias.
             # Divide bias by tp_size as we shard along the hidden dimension.
             # The bias is applied at each TP rank before the final accumulation.
             assert len(w2_weight.shape) == 1
-            w2_weight = maybe_pad_for_mxfp4(
+            w2_weight = maybe_pad_for_weights(
                 w2_weight, self.weight_alignment).float() / module.tp_size
 
         w2_weight_shard = load_weight_shard(w2_weight,
@@ -3081,11 +3117,11 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           module.tp_size,
                                           w3_weight_scale.shape[0])
 
-        w1_weight_scale = maybe_pad_for_mxfp4(
+        w1_weight_scale = maybe_pad_for_weights(
             w1_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
             alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
+        w3_weight_scale = maybe_pad_for_weights(
             w3_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
             alignment)
@@ -3151,7 +3187,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           module.tp_size,
                                           w2_weight_scale.shape[-1])
 
-        w2_weight_scale = maybe_pad_for_mxfp4(
+        w2_weight_scale = maybe_pad_for_weights(
             w2_weight_scale, alignment // module.scaling_vector_size,
             self.weight_alignment)
 
