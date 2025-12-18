@@ -2388,6 +2388,22 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                        module.fc31_alpha.data,
                                        non_blocking=True)
 
+        # Normalize biases to account for the global scale factors,
+        # matching the kernel's expectation (similar to test_moe.py logic).
+        if module.w3_w1_bias is not None:
+            # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
+            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
+
+        if module.w2_bias is not None:
+            # gemm2_bias * c_global_sf * gemm2_scales_global
+            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
+
+        if module.swiglu_beta is not None:
+            module.swiglu_beta.data.div_((module.fc31_alpha.data))
+
+        if module.swiglu_limit is not None:
+            module.swiglu_limit.data.div_((module.fc31_alpha.data))
+
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
             )
@@ -2666,12 +2682,12 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
             assert w1_weight.dtype == torch.uint8
             w1_weight = maybe_pad_for_weights(w1_weight,
-                                            self.weight_alignment // 2,
-                                            alignment)
+                                              self.weight_alignment // 2,
+                                              alignment)
             assert w3_weight.dtype == torch.uint8
             w3_weight = maybe_pad_for_weights(w3_weight,
-                                            self.weight_alignment // 2,
-                                            alignment)
+                                              self.weight_alignment // 2,
+                                              alignment)
         else:
             # Pad bias.
             assert len(w1_weight.shape) == 1
@@ -2707,7 +2723,7 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         if len(w2_weight.shape) == 2:
             assert w2_weight.dtype == torch.uint8
             w2_weight = maybe_pad_for_weights(w2_weight, alignment // 2,
-                                            self.weight_alignment)
+                                              self.weight_alignment)
         else:
             # Pad bias.
             assert len(w2_weight.shape) == 1
@@ -2957,8 +2973,9 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           module.scaling_vector_size,
                                           module.tp_size, w1_weight.shape[0])
         # Pad the proxy weight
-        w1_weight = maybe_pad_for_weights(w1_weight, self.input_hidden_alignment,
-                                        alignment)
+        w1_weight = maybe_pad_for_weights(w1_weight,
+                                          self.input_hidden_alignment,
+                                          alignment)
         # Get the slice range of each tp rank
         _, w1_weight_shard_slice = load_weight_shard(w1_weight,
                                                      module.tp_size,
@@ -3011,12 +3028,12 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
             assert w1_weight.dtype == torch.uint8
             w1_weight = maybe_pad_for_weights(w1_weight,
-                                            self.input_hidden_alignment // 2,
-                                            alignment)
+                                              self.input_hidden_alignment // 2,
+                                              alignment)
             assert w3_weight.dtype == torch.uint8
             w3_weight = maybe_pad_for_weights(w3_weight,
-                                            self.input_hidden_alignment // 2,
-                                            alignment)
+                                              self.input_hidden_alignment // 2,
+                                              alignment)
         else:
             # Pad bias, TRTLLM backend expects float32 bias.
             assert len(w1_weight.shape) == 1
@@ -3070,7 +3087,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         if len(w2_weight.shape) == 2:
             assert w2_weight.dtype == torch.uint8
             w2_weight = maybe_pad_for_weights(w2_weight, alignment // 2,
-                                            self.weight_alignment)
+                                              self.weight_alignment)
         else:
             # Pad bias, TRTLLM backend expects float32 bias.
             # Divide bias by tp_size as we shard along the hidden dimension.
