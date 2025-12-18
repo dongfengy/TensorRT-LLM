@@ -2192,6 +2192,22 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
         )
 
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                    module.scaling_vector_size,
+                                    module.tp_size, w1_weight.shape[0])
+
+        if len(w1_weight.shape) == 2:
+            # Pad weights
+            # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
+            assert w1_weight.dtype == torch.uint8
+            w1_weight = maybe_pad_for_weights(w1_weight,
+                                              self.input_hidden_alignment // 2,
+                                              alignment)
+            assert w3_weight.dtype == torch.uint8
+            w3_weight = maybe_pad_for_weights(w3_weight,
+                                              self.input_hidden_alignment // 2,
+                                              alignment)
+
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
                                             module.tp_rank,
