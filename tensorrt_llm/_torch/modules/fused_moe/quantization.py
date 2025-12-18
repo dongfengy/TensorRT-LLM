@@ -2277,6 +2277,19 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
         )
 
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w3_weight_scale.shape[0])
+        w1_weight_scale = maybe_pad_for_weights(
+            w1_weight_scale,
+            self.input_hidden_alignment // module.scaling_vector_size,
+            alignment)
+        w3_weight_scale = maybe_pad_for_weights(
+            w3_weight_scale,
+            self.input_hidden_alignment // module.scaling_vector_size,
+            alignment)
+
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2288,17 +2301,10 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                             TensorParallelMode.COLUMN,
                                             device=device)
         # Keep weights in device buffer
-        # w3
-        dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
-            dim=0, start=0, length=module.intermediate_size_per_partition)
+        dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
+            2, dim=0)
         dst_w3_weight_scale.copy_(
             w3_weight_scale.view(dst_w3_weight_scale.dtype))
-
-        # w1
-        dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition)
         dst_w1_weight_scale.copy_(
             w1_weight_scale.view(dst_w1_weight_scale.dtype))
 
@@ -2340,6 +2346,14 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
         dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
         )
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w2_weight_scale.shape[-1])
+        w2_weight_scale = maybe_pad_for_weights(
+            w2_weight_scale, alignment // module.scaling_vector_size,
+            self.weight_alignment)
 
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
