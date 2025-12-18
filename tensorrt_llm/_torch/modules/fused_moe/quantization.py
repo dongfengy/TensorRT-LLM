@@ -2237,6 +2237,23 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
         )
 
+        shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
+            w2_weight.shape) == 2 else w2_weight.shape[0]
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, shard_w2_weight_dim)
+        if len(w2_weight.shape) == 2:
+            assert w2_weight.dtype == torch.uint8
+            w2_weight = maybe_pad_for_weights(w2_weight, alignment // 2,
+                                              self.weight_alignment)
+        else:
+            assert len(w2_weight.shape) == 1
+            w2_weight = maybe_pad_for_weights(w2_weight, self.weight_alignment)
+
+            # Divide bias by tp_size as we shard along the hidden dimension.
+            # The bias is applied at each TP rank before the final accumulation.
+            w2_weight /= module.tp_size
+
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
