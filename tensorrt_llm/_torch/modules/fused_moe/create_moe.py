@@ -26,7 +26,7 @@ ENABLE_CONFIGURABLE_MOE = os.environ.get("ENABLE_CONFIGURABLE_MOE", "0") == "1"
 def get_moe_cls(
         model_config: ModelConfig,
         override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
-    print("current version ee5")
+    print("current version ee6")
     moe_backend = model_config.moe_backend
     quant_config = model_config.quant_config
     if override_quant_config is not None:

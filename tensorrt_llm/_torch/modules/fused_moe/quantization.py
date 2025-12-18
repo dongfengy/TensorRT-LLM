@@ -2207,6 +2207,12 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             w3_weight = maybe_pad_for_weights(w3_weight,
                                               self.input_hidden_alignment // 2,
                                               alignment)
+        else:
+            # Pad bias, TRTLLM backend expects float32 bias.
+            assert len(w1_weight.shape) == 1
+            assert len(w3_weight.shape) == 1
+            w1_weight = maybe_pad_for_weights(w1_weight, alignment).float()
+            w3_weight = maybe_pad_for_weights(w3_weight, alignment).float()
 
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
