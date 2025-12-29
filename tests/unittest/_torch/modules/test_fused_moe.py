@@ -1408,8 +1408,17 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
 @pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
 @pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
                          ids=lambda v: f"limit{v}")
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
 def test_fused_moe_nvfp4_gptoss_style(hidden_size, intermediate_size,
-                                      swiglu_alpha, swiglu_beta, swiglu_limit):
+                                      swiglu_alpha, swiglu_beta, swiglu_limit,
+                                      enable_configurable_moe, mocker):
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
+
     run_fused_moe_nvfp4(dtype=torch.bfloat16,
                         moe_backend="TRTLLM",
                         finalize_fusion=False,
