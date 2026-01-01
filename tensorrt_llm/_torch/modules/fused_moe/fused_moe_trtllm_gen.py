@@ -476,9 +476,6 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
-                self.hidden_size,  # valid_hidden_size_per_partition
-                self.quant_method.
-                intermediate_size_per_partition_lean,  # valid_intermediate_size_per_partition
                 self.slot_start,
                 self.expert_size_per_partition,
                 routed_scaling_factor,
@@ -493,6 +490,11 @@ class TRTLLMGenFusedMoE(MoE):
                 return outputs
             else:
                 final_hidden_states = outputs[0]
+                # Slice output if it was padded
+                if final_hidden_states.shape[1] > self.hidden_size:
+                    final_hidden_states = final_hidden_states[:, :self.
+                                                              hidden_size].contiguous(
+                                                              )
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
 

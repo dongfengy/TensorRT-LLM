@@ -41,7 +41,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
     torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
     std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
-    std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
     int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
@@ -182,7 +181,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
         args.hidden_size = hidden_states.sizes()[1] * 2;
     }
-    args.valid_hidden_size = valid_hidden_size;
     args.top_k = top_k;
     args.n_group = n_group.value_or(0);
     args.topk_group = topk_group.value_or(0);
@@ -190,7 +188,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.local_num_experts = local_num_experts;
     args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args.intermediate_size = intermediate_size;
-    args.valid_intermediate_size = valid_intermediate_size;
 
     // allocate workspace for routing kernel
     if (routing_logits.has_value() && topk_ids.has_value())
@@ -392,8 +389,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     TORCH_CHECK(output2_scales_scalar.sizes()[0] == local_num_experts, "output2_scales_scalar has incorrect dim 0.");
 
     // allocate output
-    at::Tensor output = at::detail::empty_cuda({args.num_tokens, args.valid_hidden_size.value_or(args.hidden_size)},
-        at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    at::Tensor output = at::detail::empty_cuda(
+        {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
@@ -466,9 +463,8 @@ public:
         }
     }
 
-    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(int64_t topK, int64_t hiddenSize,
-        int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens, int64_t validHiddenSize,
-        int64_t validIntermediateSize)
+    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
     {
         // returns (tileN, config)
         std::vector<std::vector<int64_t>> tactics;
@@ -479,8 +475,8 @@ public:
             {
                 continue;
             }
-            auto config_indices_per_runner = runner->getValidConfigIndices(
-                topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, validHiddenSize, validIntermediateSize);
+            auto config_indices_per_runner
+                = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
             for (auto cfg : config_indices_per_runner)
             {
                 tactics.push_back({tileN, cfg});
@@ -499,7 +495,6 @@ public:
         torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
         torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
         std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
-        std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
@@ -519,17 +514,16 @@ public:
             float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
             tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
 
-            config = mRunners[tileN]->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
-                local_num_experts, num_tokens, valid_hidden_size.value_or(hidden_size),
-                valid_intermediate_size.value_or(intermediate_size));
+            config = mRunners[tileN]->getDefaultValidConfigIndex(
+                top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
-            num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
-            local_expert_offset, local_num_experts, routed_scaling_factor, tileN, routing_method_type, do_finalize,
-            mDtypeElt, *mRunners[tileN], config, topk_weights, topk_ids);
+            num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config,
+            topk_weights, topk_ids);
     }
 
 private:
@@ -614,9 +608,8 @@ public:
             std::nullopt /*hidden_states_scale*/, gemm1_weights, gemm1_weights_scale, std::nullopt, std::nullopt,
             std::nullopt, std::nullopt, gemm2_weights, gemm2_weights_scale, std::nullopt, output1_scales_scalar,
             output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
-            intermediate_size, std::nullopt, std::nullopt, local_expert_offset, local_num_experts,
-            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeAct, *mRunners[tileN], config,
-            topk_weights, topk_ids);
+            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
+            routing_method_type, do_finalize, mDtypeAct, *mRunners[tileN], config, topk_weights, topk_ids);
     }
 
 private:
