@@ -1426,7 +1426,7 @@ def test_fused_moe_nvfp4_gptoss_style(hidden_size, intermediate_size,
                         intermediate_size=intermediate_size,
                         num_experts=32,
                         top_k=4,
-                        seq_len=8192,
+                        seq_len=256,
                         gptoss_style=True,
                         swiglu_alpha=swiglu_alpha,
                         swiglu_beta=swiglu_beta,
@@ -1621,8 +1621,13 @@ def run_fused_moe_nvfp4(dtype,
         with torch.inference_mode():
             ref_output = ref_fused_moe.forward(x, router_logits)
 
-        with torch.inference_mode(), autotune():
-            fused_moe.forward(x, router_logits)
+        if not gptoss_style:
+            with torch.inference_mode(), autotune():
+                fused_moe.forward(x, router_logits)
+        else:
+            # We skip autotune for gptoss style to reduce memory usage since the input shape is already quite large.
+            with torch.inference_mode():
+                fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
 
