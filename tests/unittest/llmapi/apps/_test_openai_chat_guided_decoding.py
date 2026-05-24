@@ -20,6 +20,9 @@ os.environ['TIKTOKEN_RS_CACHE_DIR'] = os.path.join(llm_datasets_root(),
 os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
                                                      'tiktoken_vocab')
 
+GUIDED_DECODING_REPEAT_ENV = "TRTLLM_GUIDED_DECODING_REPEAT"
+GUIDED_DECODING_PROGRESS_WIDTH = 30
+
 
 @pytest.fixture(scope="module",
                 params=[
@@ -61,7 +64,7 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
     if model_name == "meta-llama/Llama-3.1-8B-Instruct":
         model_path = get_model_path("llama-3.1-model/Llama-3.1-8B-Instruct")
     elif model_name == "openai/gpt-oss-120b":
-        model_path = get_model_path("gpt_oss/gpt-oss-120b")
+        model_path = "/tmp/models/gpt-oss-120b"
     elif model_name == "zai-org/GLM-5-FP8":
         model_path = get_model_path("GLM-5-FP8")
 
@@ -87,7 +90,7 @@ def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
 
 
-def test_json_schema(client: openai.OpenAI, model_name: str):
+def _run_json_schema(client: openai.OpenAI, model_name: str):
     json_schema = {
         "type": "object",
         "properties": {
@@ -129,7 +132,8 @@ def test_json_schema(client: openai.OpenAI, model_name: str):
     jsonschema.validate(json.loads(message.content), json_schema)
 
 
-def test_openai_compatible_json_schema(client: openai.OpenAI, model_name: str):
+def _run_openai_compatible_json_schema(client: openai.OpenAI,
+                                       model_name: str):
     json_schema = {
         "type": "object",
         "properties": {
@@ -172,7 +176,7 @@ def test_openai_compatible_json_schema(client: openai.OpenAI, model_name: str):
     jsonschema.validate(json.loads(message.content), json_schema)
 
 
-def test_json_schema_user_profile(client: openai.OpenAI, model_name: str):
+def _run_json_schema_user_profile(client: openai.OpenAI, model_name: str):
     json_schema = {
         "type": "object",
         "properties": {
@@ -249,7 +253,7 @@ def test_json_schema_user_profile(client: openai.OpenAI, model_name: str):
     ), "The model should have generated a different age in the second turn."
 
 
-def test_regex(client: openai.OpenAI, model_name: str):
+def _run_regex(client: openai.OpenAI, model_name: str):
     messages = [
         {
             "role": "system",
@@ -276,7 +280,7 @@ def test_regex(client: openai.OpenAI, model_name: str):
     assert re.match(r"(Paris|London)", message.content)
 
 
-def test_ebnf(client: openai.OpenAI, model_name: str):
+def _run_ebnf(client: openai.OpenAI, model_name: str):
     ebnf_grammar = """
 root ::= description
 city ::= "London" | "Paris" | "Berlin" | "Rome"
@@ -310,7 +314,7 @@ country ::= "England" | "France" | "Germany" | "Italy"
     assert message.content == "Paris is the capital of France"
 
 
-def test_structural_tag(client: openai.OpenAI, model_name: str):
+def _run_structural_tag(client: openai.OpenAI, model_name: str):
     tool_get_current_weather = {
         "type": "function",
         "function": {
@@ -450,3 +454,82 @@ You are a helpful assistant."""
                       message.content)
     params = json.loads(match.group(1))
     jsonschema.validate(params, tool_get_current_date["function"]["parameters"])
+
+
+def _guided_decoding_runners():
+    return [
+        ("json_schema", _run_json_schema),
+        ("openai_compatible_json_schema", _run_openai_compatible_json_schema),
+        ("json_schema_user_profile", _run_json_schema_user_profile),
+        ("regex", _run_regex),
+        ("ebnf", _run_ebnf),
+        ("structural_tag", _run_structural_tag),
+    ]
+
+
+def _guided_decoding_repeat_count():
+    repeat = int(os.environ.get(GUIDED_DECODING_REPEAT_ENV, "1"))
+    assert repeat > 0, f"{GUIDED_DECODING_REPEAT_ENV} must be positive"
+    return repeat
+
+
+def _print_guided_decoding_progress(completed: int, total: int,
+                                    iteration: int, repeat: int,
+                                    test_name: str):
+    filled = int(GUIDED_DECODING_PROGRESS_WIDTH * completed / total)
+    bar = "#" * filled + "-" * (GUIDED_DECODING_PROGRESS_WIDTH - filled)
+    print(
+        f"[guided-stress {completed}/{total}] [{bar}] "
+        f"iteration={iteration}/{repeat} test={test_name}",
+        flush=True,
+    )
+
+
+def test_json_schema(client: openai.OpenAI, model_name: str):
+    _run_json_schema(client, model_name)
+
+
+def test_openai_compatible_json_schema(client: openai.OpenAI, model_name: str):
+    _run_openai_compatible_json_schema(client, model_name)
+
+
+def test_json_schema_user_profile(client: openai.OpenAI, model_name: str):
+    _run_json_schema_user_profile(client, model_name)
+
+
+def test_regex(client: openai.OpenAI, model_name: str):
+    _run_regex(client, model_name)
+
+
+def test_ebnf(client: openai.OpenAI, model_name: str):
+    _run_ebnf(client, model_name)
+
+
+def test_structural_tag(client: openai.OpenAI, model_name: str):
+    _run_structural_tag(client, model_name)
+
+
+@pytest.mark.skipif(
+    GUIDED_DECODING_REPEAT_ENV not in os.environ,
+    reason=f"set {GUIDED_DECODING_REPEAT_ENV}=N to run stress loop",
+)
+def test_guided_decoding_stress(client: openai.OpenAI, model_name: str):
+    repeat = _guided_decoding_repeat_count()
+    runners = _guided_decoding_runners()
+    total = repeat * len(runners)
+    completed = 0
+
+    for iteration in range(1, repeat + 1):
+        for test_name, runner in runners:
+            completed += 1
+            _print_guided_decoding_progress(completed, total, iteration,
+                                            repeat, test_name)
+            try:
+                runner(client, model_name)
+            except Exception:
+                print(
+                    f"[guided-stress failure] iteration={iteration}/{repeat} "
+                    f"test={test_name}",
+                    flush=True,
+                )
+                raise
