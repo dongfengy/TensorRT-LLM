@@ -22,6 +22,10 @@ os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
 
 GUIDED_DECODING_REPEAT_ENV = "TRTLLM_GUIDED_DECODING_REPEAT"
 GUIDED_DECODING_DEBUG_ENV = "TRTLLM_GUIDED_DECODING_DEBUG"
+GUIDED_DECODING_EAGLE_ENV = "TRTLLM_GUIDED_DECODING_EAGLE"
+GUIDED_DECODING_MOE_BACKEND_ENV = "TRTLLM_GUIDED_DECODING_MOE_BACKEND"
+GUIDED_DECODING_SAMPLER_TYPE_ENV = "TRTLLM_GUIDED_DECODING_SAMPLER_TYPE"
+GUIDED_DECODING_SAMPLING_MODE_ENV = "TRTLLM_GUIDED_DECODING_SAMPLING_MODE"
 GUIDED_DECODING_PROGRESS_WIDTH = 30
 
 
@@ -38,6 +42,34 @@ def _model_dump_or_repr(value):
 
 def _debug_json(value):
     return json.dumps(value, default=str, indent=2)
+
+
+def _guided_decoding_env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "")
+    if value == "":
+        return default
+    value = value.lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
+def _guided_decoding_sampling_kwargs(default_temperature=None):
+    mode = os.environ.get(GUIDED_DECODING_SAMPLING_MODE_ENV,
+                          "baseline").lower()
+    if mode in ("", "baseline"):
+        if default_temperature is None:
+            return {}
+        return {"temperature": default_temperature}
+    if mode == "greedy":
+        return {"temperature": 0.0}
+    if mode in ("top_p1", "top_p", "top-p", "topp"):
+        return {"temperature": 1.0, "top_p": 1.0}
+    raise ValueError(
+        f"{GUIDED_DECODING_SAMPLING_MODE_ENV} must be baseline, greedy, or top_p1"
+    )
 
 
 def _print_chat_completion_debug(test_name: str, stage: str,
@@ -60,6 +92,33 @@ def _print_chat_completion_debug(test_name: str, stage: str,
     )
 
 
+def _guided_decoding_extra_llm_api_options(model_name: str):
+    extra_llm_api_options_dict = {"guided_decoding_backend": "xgrammar"}
+    if model_name != "openai/gpt-oss-120b":
+        return extra_llm_api_options_dict
+
+    moe_backend = os.environ.get(GUIDED_DECODING_MOE_BACKEND_ENV, "").strip()
+    if moe_backend:
+        extra_llm_api_options_dict["moe_config"] = {"backend": moe_backend}
+
+    sampler_type = os.environ.get(GUIDED_DECODING_SAMPLER_TYPE_ENV,
+                                  "").strip()
+    if sampler_type:
+        extra_llm_api_options_dict["sampler_type"] = sampler_type
+
+    if _guided_decoding_env_bool(GUIDED_DECODING_EAGLE_ENV, True):
+        extra_llm_api_options_dict["speculative_config"] = {
+            "decoding_type":
+            "Eagle",
+            "max_draft_len":
+            3,
+            "speculative_model_dir":
+            get_model_path("gpt_oss/gpt-oss-120b-Eagle3"),
+        }
+
+    return extra_llm_api_options_dict
+
+
 
 @pytest.fixture(scope="module",
                 params=[
@@ -74,21 +133,20 @@ def model_name(request):
 
 @pytest.fixture(scope="module")
 def temp_extra_llm_api_options_file(model_name: str):
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
+    temp_fd, temp_file_path = tempfile.mkstemp(
+        prefix="extra_llm_api_options_", suffix=".yaml")
+    os.close(temp_fd)
     try:
-        extra_llm_api_options_dict = {"guided_decoding_backend": "xgrammar"}
-        if model_name == "openai/gpt-oss-120b":
-            extra_llm_api_options_dict["speculative_config"] = {
-                "decoding_type":
-                "Eagle",
-                "max_draft_len":
-                3,
-                "speculative_model_dir":
-                get_model_path("gpt_oss/gpt-oss-120b-Eagle3"),
-            }
+        extra_llm_api_options_dict = _guided_decoding_extra_llm_api_options(
+            model_name)
         with open(temp_file_path, 'w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
+        print(
+            f"[guided-config] model={model_name} "
+            f"sampling_mode={os.environ.get(GUIDED_DECODING_SAMPLING_MODE_ENV, 'baseline')} "
+            f"extra_llm_api_options={_debug_json(extra_llm_api_options_dict)}",
+            flush=True,
+        )
 
         yield temp_file_path
     finally:
@@ -166,6 +224,7 @@ def _run_json_schema(client: openai.OpenAI, model_name: str):
             "type": "json",
             "schema": json_schema
         },
+        **_guided_decoding_sampling_kwargs(),
     )
 
     message = chat_completion.choices[0].message
@@ -215,7 +274,7 @@ def _run_openai_compatible_json_schema(client: openai.OpenAI,
             "type": "json_schema",
             "json_schema": json_schema
         },
-        temperature=0.0,
+        **_guided_decoding_sampling_kwargs(default_temperature=0.0),
     )
 
     message = chat_completion.choices[0].message
@@ -266,6 +325,7 @@ def _run_json_schema_user_profile(client: openai.OpenAI, model_name: str):
             "type": "json",
             "schema": json_schema
         },
+        **_guided_decoding_sampling_kwargs(),
     )
 
     message = chat_completion.choices[0].message
@@ -294,6 +354,7 @@ def _run_json_schema_user_profile(client: openai.OpenAI, model_name: str):
             "type": "json",
             "schema": json_schema
         },
+        **_guided_decoding_sampling_kwargs(),
     )
 
     message = chat_completion.choices[0].message
@@ -331,6 +392,7 @@ def _run_regex(client: openai.OpenAI, model_name: str):
             "type": "regex",
             "regex": "(Paris|London)"
         },
+        **_guided_decoding_sampling_kwargs(),
     )
 
     message = chat_completion.choices[0].message
@@ -366,6 +428,7 @@ country ::= "England" | "France" | "Germany" | "Italy"
             "type": "ebnf",
             "ebnf": ebnf_grammar
         },
+        **_guided_decoding_sampling_kwargs(),
     )
 
     message = chat_completion.choices[0].message
@@ -468,7 +531,6 @@ You are a helpful assistant."""
         model=model_name,
         messages=messages,
         max_completion_tokens=256,
-        temperature=0.0,
         response_format={
             "type": "structural_tag",
             "format": {
@@ -499,6 +561,7 @@ You are a helpful assistant."""
                 ],
             },
         },
+        **_guided_decoding_sampling_kwargs(default_temperature=0.0),
     )
 
     message = chat_completion.choices[0].message
