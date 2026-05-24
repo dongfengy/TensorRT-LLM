@@ -136,7 +136,12 @@ def _run_json_schema(client: openai.OpenAI, model_name: str):
                 "pattern": "^[\\w]+$"
             },
             "population": {
-                "type": "integer"
+                # Keep numeric ranges finite so guided decoding cannot emit an
+                # arbitrarily long integer and hit max_completion_tokens before
+                # closing the JSON object.
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100000000
             },
         },
         "required": ["name", "population"],
@@ -180,7 +185,12 @@ def _run_openai_compatible_json_schema(client: openai.OpenAI,
                 "pattern": "^[\\w]+$"
             },
             "population": {
-                "type": "integer"
+                # Keep numeric ranges finite so guided decoding cannot emit an
+                # arbitrarily long integer and hit max_completion_tokens before
+                # closing the JSON object.
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100000000
             },
         },
         "required": ["name", "population"],
@@ -226,6 +236,11 @@ def _run_json_schema_user_profile(client: openai.OpenAI, model_name: str):
             },
             "age": {
                 "type": "integer",
+                # Keep numeric ranges finite so guided decoding cannot emit an
+                # arbitrarily long integer and hit max_completion_tokens before
+                # closing the JSON object.
+                "minimum": 0,
+                "maximum": 120,
                 "description": "The age of the user, in years."
             },
         },
