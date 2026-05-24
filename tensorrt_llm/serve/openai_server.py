@@ -94,6 +94,28 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+GUIDED_DECODING_DEBUG_ENV = "TRTLLM_GUIDED_DECODING_DEBUG"
+
+
+def _guided_decoding_debug_enabled():
+    value = os.environ.get(GUIDED_DECODING_DEBUG_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _model_dump_or_repr(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    return repr(value)
+
+
+def _guided_debug_json(value):
+    return json.dumps(value, default=str, indent=2)
+
+
+def _guided_debug_log(label: str, value):
+    logger.warning(f"[guided-debug] {label}:\n{_guided_debug_json(value)}")
+
+
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -1615,6 +1637,33 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(f"request: {request}")
                 raise e
 
+            if _guided_decoding_debug_enabled():
+                _guided_debug_log(
+                    "chat_harmony_request",
+                    {
+                        "model": request.model,
+                        "max_completion_tokens": request.max_completion_tokens,
+                        "temperature": request.temperature,
+                        "top_p": request.top_p,
+                        "seed": request.seed,
+                        "stream": request.stream,
+                        "response_format": _model_dump_or_repr(
+                            request.response_format),
+                        "tool_choice": _model_dump_or_repr(tool_choice),
+                        "messages": request.messages,
+                        "tools": tools_dict,
+                    },
+                )
+                logger.warning(
+                    f"[guided-debug] harmony_prompt_token_count={len(harmony_tokens)}"
+                )
+                logger.warning(
+                    f"[guided-debug] harmony_prompt_token_ids={harmony_tokens}")
+                logger.warning(
+                    "[guided-debug] harmony_prompt_text:\n"
+                    f"{self.harmony_adapter._safe_decode_utf8(harmony_tokens, 'HARMONY_PROMPT: ')}"
+                )
+
             # Get harmony stop tokens
             harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
             if request.stop_token_ids:
@@ -1626,6 +1675,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 vocab_size=self._logit_bias_vocab_size(),
                 reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
+            if _guided_decoding_debug_enabled():
+                _guided_debug_log(
+                    "chat_harmony_sampling",
+                    {
+                        "stop_token_ids": request.stop_token_ids,
+                        "sampling_params": _model_dump_or_repr(
+                            sampling_params),
+                    },
+                )
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
             trace_headers = (None if raw_request is None else

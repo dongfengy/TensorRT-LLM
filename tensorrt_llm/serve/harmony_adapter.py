@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 import re
 import time
 import traceback
@@ -29,6 +30,38 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               to_disaggregated_params)
 
 # yapf: enable
+
+GUIDED_DECODING_DEBUG_ENV = "TRTLLM_GUIDED_DECODING_DEBUG"
+
+
+def _guided_decoding_debug_enabled():
+    value = os.environ.get(GUIDED_DECODING_DEBUG_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _guided_debug_json(value):
+    return json.dumps(value, default=str, indent=2)
+
+
+def _guided_debug_log(label: str, value):
+    logger.warning(f"[guided-debug] {label}:\n{_guided_debug_json(value)}")
+
+
+def _harmony_content_to_text(msg_content):
+    if msg_content is None:
+        return ""
+    if not isinstance(msg_content, list):
+        msg_content = [msg_content]
+
+    parts = []
+    for content in msg_content:
+        if isinstance(content, TextContent):
+            parts.append(content.text)
+        elif hasattr(content, 'text'):
+            parts.append(content.text)
+        else:
+            parts.append(str(content))
+    return "".join(parts)
 
 
 def _check_channel_valid(generated_channels: List[str], channel: str) -> bool:
@@ -1104,10 +1137,39 @@ class HarmonyAdapter:
             clean_tokens = self._strip_incomplete_messages(
                 harmony_output_tokens)
 
+            if _guided_decoding_debug_enabled():
+                _guided_debug_log(
+                    "harmony_output_tokens_before_parse",
+                    {
+                        "raw_token_count": len(harmony_output_tokens),
+                        "raw_token_ids": harmony_output_tokens,
+                        "raw_text": self._safe_decode_utf8(
+                            harmony_output_tokens, "HARMONY_OUTPUT: "),
+                        "clean_token_count": len(clean_tokens),
+                        "clean_token_ids": clean_tokens,
+                        "clean_text": self._safe_decode_utf8(
+                            clean_tokens, "HARMONY_CLEAN_OUTPUT: "),
+                    },
+                )
+
             # Use parse_messages_from_completion_tokens for non-streaming complete parsing
             try:
                 harmony_messages = self.encoding.parse_messages_from_completion_tokens(
                     clean_tokens, role=Role.ASSISTANT)
+                if _guided_decoding_debug_enabled():
+                    _guided_debug_log(
+                        "harmony_parse_messages_from_completion_tokens",
+                        [{
+                            "index": idx,
+                            "channel": getattr(msg, 'channel', None),
+                            "recipient": str(getattr(msg, 'recipient', None)),
+                            "content_type": str(
+                                getattr(msg, 'content_type', None)),
+                            "content_text": _harmony_content_to_text(
+                                getattr(msg, 'content', [])),
+                            "message_repr": repr(msg),
+                        } for idx, msg in enumerate(harmony_messages)],
+                    )
             except (HarmonyError, UnicodeDecodeError,
                     ValueError) as parse_error:
                 logger.warning(
@@ -1132,7 +1194,30 @@ class HarmonyAdapter:
                 msg_recipient = getattr(msg, 'recipient', None)
                 msg_content = getattr(msg, 'content', [])
 
+                if _guided_decoding_debug_enabled():
+                    _guided_debug_log(
+                        "harmony_parser_step_input_message",
+                        {
+                            "channel": msg_channel,
+                            "recipient": str(msg_recipient),
+                            "content_type": str(
+                                getattr(msg, 'content_type', None)),
+                            "content_text": _harmony_content_to_text(
+                                msg_content),
+                        },
+                    )
+
                 if not _check_channel_valid(generated_channels, msg_channel):
+                    if _guided_decoding_debug_enabled():
+                        _guided_debug_log(
+                            "harmony_parser_step_skipped_invalid_channel",
+                            {
+                                "generated_channels": generated_channels,
+                                "skipped_channel": msg_channel,
+                                "skipped_text": _harmony_content_to_text(
+                                    msg_content),
+                            },
+                        )
                     continue
 
                 # Check for tool calls first, regardless of channel.
@@ -1199,6 +1284,19 @@ class HarmonyAdapter:
             result = self._apply_harmony_to_openai_mapping(
                 analysis_content, commentary_preambles, tool_calls,
                 final_content)
+
+            if _guided_decoding_debug_enabled():
+                _guided_debug_log(
+                    "harmony_parser_grouped_output",
+                    {
+                        "generated_channels": generated_channels,
+                        "analysis_content": analysis_content,
+                        "commentary_preambles": commentary_preambles,
+                        "tool_calls": tool_calls,
+                        "final_content": final_content,
+                    },
+                )
+                _guided_debug_log("harmony_openai_mapping_result", result)
 
             return result
 
@@ -1800,6 +1898,17 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         # Determine finish reason
         finish_reason = _determine_finish_reason(parsed_output,
                                                  output.finish_reason)
+        if _guided_decoding_debug_enabled():
+            _guided_debug_log(
+                "chat_harmony_non_streaming_response_message",
+                {
+                    "finish_reason": finish_reason,
+                    "raw_output_token_count": len(output.token_ids),
+                    "raw_output_token_ids": output.token_ids,
+                    "parsed_output": parsed_output,
+                    "response_message": response_message,
+                },
+            )
         # Optional: Log if harmony parsing failed (for debugging)
         if parsed_output.get('_harmony_parsing_failed'):
             logger.warning(

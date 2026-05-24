@@ -21,7 +21,44 @@ os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
                                                      'tiktoken_vocab')
 
 GUIDED_DECODING_REPEAT_ENV = "TRTLLM_GUIDED_DECODING_REPEAT"
+GUIDED_DECODING_DEBUG_ENV = "TRTLLM_GUIDED_DECODING_DEBUG"
 GUIDED_DECODING_PROGRESS_WIDTH = 30
+
+
+def _guided_decoding_debug_enabled():
+    value = os.environ.get(GUIDED_DECODING_DEBUG_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _model_dump_or_repr(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    return repr(value)
+
+
+def _debug_json(value):
+    return json.dumps(value, default=str, indent=2)
+
+
+def _print_chat_completion_debug(test_name: str, stage: str,
+                                 chat_completion):
+    if not _guided_decoding_debug_enabled():
+        return
+
+    choice = chat_completion.choices[0]
+    message = choice.message
+    print(
+        f"[guided-debug] test={test_name} stage={stage} "
+        f"finish_reason={choice.finish_reason} role={message.role} "
+        f"content_repr={message.content!r}",
+        flush=True,
+    )
+    print(
+        f"[guided-debug] test={test_name} stage={stage} "
+        f"message={_debug_json(_model_dump_or_repr(message))}",
+        flush=True,
+    )
+
 
 
 @pytest.fixture(scope="module",
@@ -127,6 +164,7 @@ def _run_json_schema(client: openai.OpenAI, model_name: str):
     )
 
     message = chat_completion.choices[0].message
+    _print_chat_completion_debug("json_schema", "response", chat_completion)
     assert message.content is not None
     assert message.role == "assistant"
     jsonschema.validate(json.loads(message.content), json_schema)
@@ -171,6 +209,8 @@ def _run_openai_compatible_json_schema(client: openai.OpenAI,
     )
 
     message = chat_completion.choices[0].message
+    _print_chat_completion_debug("openai_compatible_json_schema", "response",
+                                 chat_completion)
     assert message.content is not None
     assert message.role == "assistant"
     jsonschema.validate(json.loads(message.content), json_schema)
@@ -214,6 +254,8 @@ def _run_json_schema_user_profile(client: openai.OpenAI, model_name: str):
     )
 
     message = chat_completion.choices[0].message
+    _print_chat_completion_debug("json_schema_user_profile", "first_response",
+                                 chat_completion)
     assert message.content is not None
     assert message.role == "assistant"
     first_json = json.loads(message.content)
@@ -240,6 +282,8 @@ def _run_json_schema_user_profile(client: openai.OpenAI, model_name: str):
     )
 
     message = chat_completion.choices[0].message
+    _print_chat_completion_debug("json_schema_user_profile", "second_response",
+                                 chat_completion)
     assert message.content is not None
     assert message.role == "assistant"
     second_json = json.loads(message.content)
@@ -275,6 +319,7 @@ def _run_regex(client: openai.OpenAI, model_name: str):
     )
 
     message = chat_completion.choices[0].message
+    _print_chat_completion_debug("regex", "response", chat_completion)
     assert message.content is not None
     assert message.role == "assistant"
     assert re.match(r"(Paris|London)", message.content)
@@ -309,6 +354,7 @@ country ::= "England" | "France" | "Germany" | "Italy"
     )
 
     message = chat_completion.choices[0].message
+    _print_chat_completion_debug("ebnf", "response", chat_completion)
     assert message.content is not None
     assert message.role == "assistant"
     assert message.content == "Paris is the capital of France"
@@ -441,6 +487,7 @@ You are a helpful assistant."""
     )
 
     message = chat_completion.choices[0].message
+    _print_chat_completion_debug("structural_tag", "response", chat_completion)
     assert message.content is not None
     assert message.role == "assistant"
 
