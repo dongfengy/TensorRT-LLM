@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -272,6 +273,32 @@ bool getEnvEnablePDL()
             }
         });
     return enablePDL;
+}
+
+bool getEnvEnablePDLForKernel(char const* disableEnvName)
+{
+    if (!getEnvEnablePDL())
+    {
+        return false;
+    }
+
+    static std::mutex mutex;
+    static std::unordered_map<std::string, bool> disabledByName;
+
+    std::lock_guard<std::mutex> const lock(mutex);
+    auto const it = disabledByName.find(disableEnvName);
+    if (it != disabledByName.end())
+    {
+        return !it->second;
+    }
+
+    bool const disabled = getBoolEnv(disableEnvName);
+    if (disabled)
+    {
+        TLLM_LOG_INFO("PDL disabled by %s", disableEnvName);
+    }
+    disabledByName.emplace(disableEnvName, disabled);
+    return !disabled;
 }
 
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()

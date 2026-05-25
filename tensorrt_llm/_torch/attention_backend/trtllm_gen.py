@@ -33,7 +33,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from tensorrt_llm._torch.flashinfer_utils import (IS_FLASHINFER_AVAILABLE,
+                                                 get_env_enable_pdl_for_kernel)
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -524,7 +525,7 @@ class FlashInferTrtllmGenAttention:
         self._checker = TrtllmGenSupportChecker()
         self._layout = self.DEFAULT_KV_LAYOUT
         # Read once so the hot path is not sensitive to later environment changes.
-        self._enable_pdl = get_env_enable_pdl()
+        self._enable_pdl = get_env_enable_pdl_for_kernel("TRTLLM_DISABLE_PDL_TRTLLM_GEN_ATTENTION_BACKEND")
         missing_ops = self._missing_fused_nanobind_ops()
         if missing_ops:
             raise RuntimeError(

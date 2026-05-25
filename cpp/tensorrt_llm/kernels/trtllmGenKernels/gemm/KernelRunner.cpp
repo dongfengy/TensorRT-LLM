@@ -139,7 +139,7 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL(), globalTrtllmGenGemmModuleCache);
+        tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_TRTLLM_GEN_GEMM"), globalTrtllmGenGemmModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }

@@ -22,12 +22,13 @@ import torch.nn.functional as F
 from einops import rearrange
 
 try:
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl_for_kernel
 except (ModuleNotFoundError, ImportError):
     import os
 
-    def get_env_enable_pdl() -> bool:
-        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    def get_env_enable_pdl_for_kernel(disable_env_name: str) -> bool:
+        return (os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+                and os.environ.get(disable_env_name, "0") != "1")
 
 
 try:
@@ -51,7 +52,7 @@ def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) ->
     """
     # Flashinfer rmsnorm expects a 2D input
     input_flat = input.reshape(-1, input.shape[-1])
-    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps, enable_pdl=get_env_enable_pdl())
+    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps, enable_pdl=get_env_enable_pdl_for_kernel("TRTLLM_DISABLE_PDL_AD_FLASHINFER_RMSNORM"))
     return rmsnorm_flat.reshape(input.shape)
 
 

@@ -60,6 +60,10 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Whether PDL is enabled after applying a kernel/family-specific disable env.
+// The argument is an env var name such as TRTLLM_DISABLE_PDL_TRTLLM_GEN_GEMM.
+bool getEnvEnablePDLForKernel(char const* disableEnvName);
+
 // Whether PDL is enabled for MoE Renormalize routing kernel.
 // Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
 // Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
@@ -78,7 +82,7 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_COMMON_LAUNCH_WITH_PDL");
     kernelConfig.attrs = attrs;
     kernelConfig.numAttrs = 1;
 

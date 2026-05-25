@@ -588,7 +588,7 @@ void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t str
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_HELIX_ALLTOALL");
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params));

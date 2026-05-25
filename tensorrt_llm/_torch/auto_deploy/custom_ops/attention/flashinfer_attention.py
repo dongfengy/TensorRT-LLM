@@ -25,12 +25,13 @@ from torch.fx import Node
 from ..._compat import KvCacheConfig
 
 try:
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl_for_kernel
 except (ModuleNotFoundError, ImportError):
     import os
 
-    def get_env_enable_pdl() -> bool:
-        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    def get_env_enable_pdl_for_kernel(disable_env_name: str) -> bool:
+        return (os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+                and os.environ.get(disable_env_name, "0") != "1")
 
 
 from ...utils.cuda_graph import cuda_graph_state
@@ -446,7 +447,7 @@ def flashinfer_mha_with_cache(
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
-            enable_pdl=get_env_enable_pdl(),
+            enable_pdl=get_env_enable_pdl_for_kernel("TRTLLM_DISABLE_PDL_AD_FLASHINFER_ATTENTION"),
             out=y[:num_prefill_tokens],
         )
 
@@ -477,7 +478,7 @@ def flashinfer_mha_with_cache(
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
-            enable_pdl=get_env_enable_pdl(),
+            enable_pdl=get_env_enable_pdl_for_kernel("TRTLLM_DISABLE_PDL_AD_FLASHINFER_ATTENTION"),
             out=y[num_prefill_tokens:num_total_tokens],
         )
 

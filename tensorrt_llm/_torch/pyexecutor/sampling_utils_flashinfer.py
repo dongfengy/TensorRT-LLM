@@ -31,7 +31,7 @@ else:
     from typing_extensions import override
 
 from ..._utils import prefer_pinned
-from ..flashinfer_utils import get_env_enable_pdl
+from ..flashinfer_utils import get_env_enable_pdl_for_kernel
 from .sampling_utils import (
     GREEDY,
     BeamSearch,
@@ -123,7 +123,7 @@ class _StrategyImpls:
             probs: torch.Tensor = flashinfer.sampling.softmax(
                 logits,
                 temperature,
-                enable_pdl=get_env_enable_pdl(),
+                enable_pdl=get_env_enable_pdl_for_kernel("TRTLLM_DISABLE_PDL_FLASHINFER_SAMPLING"),
             )
             return probs
 

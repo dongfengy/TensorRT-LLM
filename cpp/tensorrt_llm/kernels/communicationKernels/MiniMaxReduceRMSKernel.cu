@@ -734,7 +734,7 @@ void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params)
 
     cudaLaunchAttribute attribute[2];
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MINIMAX_REDUCE_RMS") ? 1 : 0;
     attribute[1].id = cudaLaunchAttributeClusterDimension;
     attribute[1].val.clusterDim.x = cluster_size;
     attribute[1].val.clusterDim.y = 1;
@@ -789,7 +789,7 @@ void minimax_reduce_rms_kernel_launcher_float4(MiniMaxReduceRMSParams const& par
 
     cudaLaunchAttribute attribute[2];
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MINIMAX_REDUCE_RMS") ? 1 : 0;
     attribute[1].id = cudaLaunchAttributeClusterDimension;
     attribute[1].val.clusterDim.x = cluster_size;
     attribute[1].val.clusterDim.y = 1;

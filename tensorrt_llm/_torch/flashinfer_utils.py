@@ -14,6 +14,15 @@ def get_env_enable_pdl() -> bool:
         setattr(get_env_enable_pdl, "_printed", True)
     return enabled
 
+def get_env_enable_pdl_for_kernel(disable_env_name: str) -> bool:
+    enabled = get_env_enable_pdl()
+    disabled = enabled and os.environ.get(disable_env_name, "0") == "1"
+    printed_key = f"_printed_{disable_env_name}"
+    if disabled and not getattr(get_env_enable_pdl_for_kernel, printed_key, False):
+        logger.info("PDL disabled by %s", disable_env_name)
+        setattr(get_env_enable_pdl_for_kernel, printed_key, True)
+    return enabled and not disabled
+
 
 if platform.system() != "Windows":
     try:

@@ -187,7 +187,7 @@ void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_DSV3_ROUTER_GEMM");
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(

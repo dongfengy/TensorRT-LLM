@@ -1270,7 +1270,7 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     config.stream = stream;                                                                                            \
     cudaLaunchAttribute attrs[1];                                                                                      \
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                  \
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();                     \
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_UNFUSED_ATTENTION_BIAS_ROPE");                     \
     config.numAttrs = 1;                                                                                               \
     config.attrs = attrs;                                                                                              \
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \

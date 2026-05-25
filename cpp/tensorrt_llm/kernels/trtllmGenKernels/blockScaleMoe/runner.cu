@@ -81,7 +81,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         //
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
         routingData.mDtypeInput = dtypeRoutingLogits;
-        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_ROUTING_DEEPSEEK_NOGROUP");
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
@@ -133,7 +133,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         //
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
         routingData.mDtypeInput = dtypeRoutingLogits;
-        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_ROUTING_SIGMOID_RENORM");
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::Sigmoid;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::SumNormalize;
         routingData.mNormTopkProb = true;
@@ -184,7 +184,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         //
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
         routingData.mDtypeInput = dtypeRoutingLogits;
-        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_ROUTING_MINIMAX2");
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
@@ -232,7 +232,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
         moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
-        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_ROUTING_DEEPSEEK");
 
         // output:
         routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -276,7 +276,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         }
         moe::dev::routing::routingLlama4::Data routingData;
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
-        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_ROUTING_LLAMA4");
 
         // output:
         routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -327,7 +327,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
         routingData.mDtypeInput = dtypeRoutingLogits;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_ROUTING_DEFAULT_RENORM");
         if (routingMethodType == RoutingMethodType::Default)
         {
             // Default: Softmax -> TopK (no postprocessing)
@@ -656,11 +656,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     convertSfData.numTokens = args.num_tokens;
     convertSfData.sfLayoutSrc = btg::SfLayout::R128c4;
     convertSfData.sfLayoutDst = btg::SfLayout::Linear;
-    convertSfData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+    convertSfData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_CONVERT_SF");
 
     // Setup activation data
     activationData.mDtypeElt = args.mDtypeElt;
-    activationData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+    activationData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_ACTIVATION");
     activationData.mUseDeepSeekFp8 = true;
     activationData.inPtr = workspace.gemm1_output;
     activationData.outPtr = workspace.activation_output;
@@ -678,7 +678,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         // Setup finalize data
         finalizeData.mDtypeElt = args.mDtypeOut;
         finalizeData.mDtypeExpW = args.mDtypeExpW;
-        finalizeData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        finalizeData.mUsePdl = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_MOE_FINALIZE");
         finalizeData.mUseDeepSeekFp8 = false;
         finalizeData.inPtr = workspace.gemm2_output;
         finalizeData.outPtr = args.output;

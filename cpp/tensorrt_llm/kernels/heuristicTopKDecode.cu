@@ -219,7 +219,7 @@ void launchHeuristicTopKDecodeImpl(InputT const* logits, int const* seqLens, int
         config.stream = stream;
         cudaLaunchAttribute attrs[1];
         attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_HEURISTIC_TOPK_DECODE");
         config.numAttrs = 1;
         config.attrs = attrs;
 

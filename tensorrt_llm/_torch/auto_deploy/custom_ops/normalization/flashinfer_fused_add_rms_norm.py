@@ -14,12 +14,13 @@ import flashinfer
 import torch
 
 try:
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl_for_kernel
 except (ModuleNotFoundError, ImportError):
     import os
 
-    def get_env_enable_pdl() -> bool:
-        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    def get_env_enable_pdl_for_kernel(disable_env_name: str) -> bool:
+        return (os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+                and os.environ.get(disable_env_name, "0") != "1")
 
 
 @torch.library.custom_op(
@@ -43,7 +44,7 @@ def flashinfer_fused_add_rms_norm_inplace(
     residual_flat = residual.view(-1, residual.shape[-1])
 
     flashinfer.norm.fused_add_rmsnorm(
-        x_flat, residual_flat, weight, eps, enable_pdl=get_env_enable_pdl()
+        x_flat, residual_flat, weight, eps, enable_pdl=get_env_enable_pdl_for_kernel("TRTLLM_DISABLE_PDL_AD_FLASHINFER_FUSED_ADD_RMSNORM")
     )
     x_flat.view(x_shape)
     residual_flat.view(residual_shape)

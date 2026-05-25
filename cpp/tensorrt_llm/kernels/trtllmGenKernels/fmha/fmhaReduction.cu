@@ -404,7 +404,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
     // The PDL attribute.
     cudaLaunchAttribute attribute[1];
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_TRTLLM_GEN_FMHA_REDUCTION") ? 1 : 0;
     cudaLaunchConfig_t config;
     config.gridDim = gridDim;
     config.blockDim = blockDim;

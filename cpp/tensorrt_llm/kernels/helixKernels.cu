@@ -525,7 +525,7 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_HELIX_KERNELS");
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params.output, params.gathered_o,
@@ -561,7 +561,7 @@ void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_HELIX_KERNELS");
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params.output, params.gathered_o,
@@ -597,7 +597,7 @@ void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_HELIX_KERNELS");
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params.output, params.gathered_o,

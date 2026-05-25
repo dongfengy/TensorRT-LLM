@@ -849,7 +849,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.stream = stream;
         cudaLaunchAttribute attrs[1];
         attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_INDEXER_TOPK");
         config.numAttrs = 1;
         config.attrs = attrs;
 
@@ -868,7 +868,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.stream = stream;
         cudaLaunchAttribute attrs[1];
         attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_INDEXER_TOPK");
         config.numAttrs = 1;
         config.attrs = attrs;
 
@@ -887,7 +887,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part1.stream = stream;
         cudaLaunchAttribute attrs[1];
         attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_INDEXER_TOPK");
         config_part1.numAttrs = 1;
         config_part1.attrs = attrs;
 
@@ -979,7 +979,7 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.stream = stream;
         cudaLaunchAttribute attrs[1];
         attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_INDEXER_TOPK");
         config.numAttrs = 1;
         config.attrs = attrs;
 
@@ -999,7 +999,7 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.stream = stream;
         cudaLaunchAttribute attrs[1];
         attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_INDEXER_TOPK");
         config.numAttrs = 1;
         config.attrs = attrs;
 
