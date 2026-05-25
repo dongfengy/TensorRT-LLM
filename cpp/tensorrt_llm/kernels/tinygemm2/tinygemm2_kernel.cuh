@@ -177,6 +177,9 @@ enum TinyGemm2PdlMode
     TinyGemm2PdlNoExplicitRelease = 1,
     TinyGemm2PdlReleaseAfterReduction = 2,
     TinyGemm2PdlReleaseAfterStore = 3,
+    TinyGemm2PdlReleaseAfterReductionNoTail = 4,
+    TinyGemm2PdlReleaseAfterReductionThread0 = 5,
+    TinyGemm2PdlReleaseAfterReductionThread0Tail = 6,
 };
 
 template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL, bool PROFILE>
@@ -719,7 +722,14 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel_pdl_experiment(__nv_bf
 
         __syncthreads();
 
-        if (pdlMode == TinyGemm2PdlReleaseAfterReduction)
+        if (pdlMode == TinyGemm2PdlReleaseAfterReduction
+            || pdlMode == TinyGemm2PdlReleaseAfterReductionNoTail)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+        if ((pdlMode == TinyGemm2PdlReleaseAfterReductionThread0
+                || pdlMode == TinyGemm2PdlReleaseAfterReductionThread0Tail)
+            && threadIdx.x == 0)
         {
             cudaTriggerProgrammaticLaunchCompletion();
         }
@@ -760,7 +770,8 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel_pdl_experiment(__nv_bf
             if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0)
                 profile[blockIdx.x].complete = gclock64();
         }
-        if (pdlMode == TinyGemm2PdlReleaseAfterReduction)
+        if (pdlMode == TinyGemm2PdlReleaseAfterReduction
+            || pdlMode == TinyGemm2PdlReleaseAfterReductionThread0Tail)
         {
             __syncthreads();
         }

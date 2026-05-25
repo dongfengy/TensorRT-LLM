@@ -47,6 +47,18 @@ int getTinyGemm2PdlMode()
     {
         return TinyGemm2PdlReleaseAfterStore;
     }
+    if (std::strcmp(mode, "release_after_reduction_no_tail") == 0)
+    {
+        return TinyGemm2PdlReleaseAfterReductionNoTail;
+    }
+    if (std::strcmp(mode, "release_after_reduction_thread0") == 0)
+    {
+        return TinyGemm2PdlReleaseAfterReductionThread0;
+    }
+    if (std::strcmp(mode, "release_after_reduction_thread0_tail") == 0)
+    {
+        return TinyGemm2PdlReleaseAfterReductionThread0Tail;
+    }
     return TinyGemm2PdlCurrent;
 }
 
