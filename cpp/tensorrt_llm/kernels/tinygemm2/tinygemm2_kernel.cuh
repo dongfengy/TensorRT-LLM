@@ -171,6 +171,14 @@ struct Profile
     uint64_t complete;
 };
 
+enum TinyGemm2PdlMode
+{
+    TinyGemm2PdlCurrent = 0,
+    TinyGemm2PdlNoExplicitRelease = 1,
+    TinyGemm2PdlReleaseAfterReduction = 2,
+    TinyGemm2PdlReleaseAfterStore = 3,
+};
+
 template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL, bool PROFILE>
 __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output, __nv_bfloat16* weights,
     __nv_bfloat16* activations, __nv_bfloat16* bias, int M, int N, int K,
@@ -452,6 +460,309 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
             if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0)
                 profile[blockIdx.x].complete = gclock64();
+        }
+    }
+#endif // end if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+}
+
+template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL, bool PROFILE>
+__global__ __launch_bounds__(384, 1) void tinygemm_kernel_pdl_experiment(__nv_bfloat16* output, __nv_bfloat16* weights,
+    __nv_bfloat16* activations, __nv_bfloat16* bias, int M, int N, int K,
+    const __grid_constant__ CUtensorMap weight_map, const __grid_constant__ CUtensorMap activation_map,
+    Profile* profile = nullptr, int pdlMode = TinyGemm2PdlCurrent)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+
+    if (PROFILE && threadIdx.x == 0 && blockIdx.y == 0)
+        profile[blockIdx.x].start = gclock64();
+
+    extern __shared__ __align__(128) char smem[];
+
+    __nv_bfloat16* sh_weights = (__nv_bfloat16*) &smem[0];
+    __nv_bfloat16* sh_activations
+        = (__nv_bfloat16*) &smem[STAGES * STAGE_UNROLL * TILE_M * TILE_K * sizeof(__nv_bfloat16)];
+
+#pragma nv_diag_suppress static_var_with_dynamic_init
+    __shared__ barrier bar_wt_ready[STAGES];
+    __shared__ barrier bar_act_ready[STAGES];
+    __shared__ barrier bar_data_consumed[STAGES];
+
+    __shared__ float4 reduction_buffer[128];
+
+    __shared__ nv_bfloat16 sh_bias[TILE_M];
+
+    if (threadIdx.x == 0)
+    {
+        for (int i = 0; i < STAGES; i++)
+        {
+            init(&bar_wt_ready[i], 1);
+            init(&bar_act_ready[i], 1);
+            init(&bar_data_consumed[i], 32);
+        }
+        ptx::fence_proxy_async(ptx::space_shared);
+        asm volatile("prefetch.tensormap [%0];" : : "l"(reinterpret_cast<uint64_t>(&weight_map)) : "memory");
+        asm volatile("prefetch.tensormap [%0];" : : "l"(reinterpret_cast<uint64_t>(&activation_map)) : "memory");
+    }
+    __syncthreads();
+
+    // int warp_id = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    int phase = 0;
+
+    int mib = blockIdx.x * TILE_M;
+    int ni = blockIdx.y * TILE_N;
+
+    float accum[4];
+    for (int i = 0; i < 4; i++)
+        accum[i] = 0.f;
+
+    int const K_LOOPS_DMA = (K + 4 * TILE_K * STAGE_UNROLL - 1) / (4 * (TILE_K * STAGE_UNROLL));
+    int const K_LOOPS_COMPUTE = K_LOOPS_DMA;
+
+    // Data loading thread
+    if (warp_id >= 4 && elect_one_sync())
+    {
+        int stage = warp_id % 4;
+
+        bool weight_warp = warp_id < 8;
+        if (!weight_warp)
+        {
+            cudaGridDependencySynchronize();
+            if (pdlMode == TinyGemm2PdlCurrent)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+
+        for (int ki = 0; ki < K_LOOPS_DMA; ki++)
+        {
+
+            int k = (ki * 4 + (warp_id % 4)) * TILE_K * STAGE_UNROLL;
+
+            uint64_t desc_ptr_wt = reinterpret_cast<uint64_t>(&weight_map);
+            uint64_t desc_ptr_act = reinterpret_cast<uint64_t>(&activation_map);
+
+            uint32_t bar_ptr_wt = __cvta_generic_to_shared(&bar_wt_ready[stage]);
+            uint32_t bar_ptr_act = __cvta_generic_to_shared(&bar_act_ready[stage]);
+            int bytes_wt = TILE_M * TILE_K * sizeof(__nv_bfloat16);
+            int bytes_act = TILE_N * TILE_K * sizeof(__nv_bfloat16);
+
+            bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
+
+            if (weight_warp)
+                asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                             :
+                             : "r"(bar_ptr_wt), "r"(STAGE_UNROLL * bytes_wt));
+            if (!weight_warp)
+                asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                             :
+                             : "r"(bar_ptr_act), "r"(STAGE_UNROLL * bytes_act));
+
+            if (PROFILE && blockIdx.y == 0 && ki == 0 && weight_warp)
+                profile[blockIdx.x].weight_load_start = gclock64();
+            if (PROFILE && blockIdx.y == 0 && ki == 0 && !weight_warp)
+                profile[blockIdx.x].act_load_start = gclock64();
+
+            for (int i = 0; i < STAGE_UNROLL; i++)
+            {
+                uint32_t smem_ptr_wt
+                    = __cvta_generic_to_shared(&sh_weights[(stage * STAGE_UNROLL + i) * TILE_M * TILE_K]);
+                uint32_t crd0 = k + i * TILE_K;
+                uint32_t crd1 = mib;
+                if (weight_warp)
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%3,%4}], "
+                        "[%2];"
+                        :
+                        : "r"(smem_ptr_wt), "l"(desc_ptr_wt), "r"(bar_ptr_wt), "r"(crd0), "r"(crd1)
+                        : "memory");
+
+                uint32_t smem_ptr_act
+                    = __cvta_generic_to_shared(&sh_activations[(stage * STAGE_UNROLL + i) * TILE_N * TILE_K]);
+                crd0 = k + i * TILE_K;
+                crd1 = ni;
+                if (!weight_warp)
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%3,%4}], "
+                        "[%2];"
+                        :
+                        : "r"(smem_ptr_act), "l"(desc_ptr_act), "r"(bar_ptr_act), "r"(crd0), "r"(crd1)
+                        : "memory");
+            }
+
+            stage += 4;
+            if (stage >= STAGES)
+            {
+                stage = warp_id % 4;
+                phase ^= 1;
+            }
+        }
+        // Wait for pending loads to be consumed before exiting, to avoid race
+        for (int i = 0; i < (STAGES / 4) - 1; i++)
+        {
+            bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
+            stage += 4;
+            if (stage >= STAGES)
+            {
+                stage = warp_id % 4;
+                phase ^= 1;
+            }
+        }
+    }
+    // Compute threads
+    else if (warp_id < 4)
+    {
+
+        // Sneak the bias load into the compute warps since they're just waiting for stuff anyway
+        if (threadIdx.x < TILE_M)
+            sh_bias[threadIdx.x] = bias[mib + threadIdx.x];
+
+        int stage = warp_id;
+
+        int phase = 0;
+        int lane_id_div8 = lane_id / 8;
+        int lane_id_mod8 = lane_id % 8;
+
+        int lane_row_offset_wt = (lane_id_div8 % 2) ? 8 : 0;
+        int lane_col_offset_wt = (lane_id_div8 / 2) ? 1 : 0;
+
+        int row_wt = lane_id_mod8 + lane_row_offset_wt;
+        int row_act = lane_id_mod8;
+
+        int row_offset_wt = (reinterpret_cast<uintptr_t>(sh_weights) / 128) % 8;
+        // int row_offset_act = (reinterpret_cast <uintptr_t>(ptr_act)/128)%8;
+        // assert(row_offset_wt==row_offset_act);
+        int row_offset_act = row_offset_wt;
+
+        uint32_t bar_ptr_wt = __cvta_generic_to_shared(&bar_wt_ready[stage]);
+        uint32_t bar_ptr_act = __cvta_generic_to_shared(&bar_act_ready[stage]);
+
+        bool weight_ready = bar_try_wait(bar_ptr_wt, phase);
+        bool act_ready = bar_try_wait(bar_ptr_act, phase);
+
+#pragma unroll 2
+        for (int ki = 0; ki < K_LOOPS_COMPUTE; ki++)
+        {
+
+            int next_stage = stage + 4;
+            int next_phase = phase;
+            if (next_stage >= STAGES)
+            {
+                next_stage = warp_id;
+                next_phase ^= 1;
+            }
+
+            while (!weight_ready || !act_ready)
+            {
+                weight_ready = bar_try_wait(bar_ptr_wt, phase);
+                act_ready = bar_try_wait(bar_ptr_act, phase);
+            }
+
+            if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0 && ki == 0)
+                profile[blockIdx.x].compute_start = gclock64();
+
+            if (ki + 1 < K_LOOPS_COMPUTE)
+            {
+                weight_ready = bar_try_wait(__cvta_generic_to_shared(&bar_wt_ready[next_stage]), next_phase);
+                act_ready = bar_try_wait(__cvta_generic_to_shared(&bar_act_ready[next_stage]), next_phase);
+            }
+
+#pragma unroll
+            for (int su = 0; su < STAGE_UNROLL; su++)
+            {
+                __nv_bfloat16* ptr_weights = &sh_weights[(stage * STAGE_UNROLL + su) * TILE_M * TILE_K];
+                __nv_bfloat16* ptr_act = &sh_activations[(stage * STAGE_UNROLL + su) * TILE_N * TILE_K];
+
+#pragma unroll
+                for (int kii = 0; kii < TILE_K / 16; kii++)
+                {
+
+                    __nv_bfloat16 a[8];
+                    __nv_bfloat16 b[4];
+
+                    int col = 2 * kii + lane_col_offset_wt;
+                    int col_sw = ((row_wt + row_offset_wt) % 8) ^ col;
+
+                    ldmatrix4(a, __cvta_generic_to_shared(&ptr_weights[row_wt * TILE_K + col_sw * 8]));
+
+                    col = 2 * kii + lane_id_div8;
+                    col_sw = ((row_act + row_offset_act) % 8) ^ col;
+
+                    ldmatrix2(b, __cvta_generic_to_shared(&ptr_act[row_act * TILE_K + 8 * col_sw]));
+
+                    HMMA_16816(accum, a, b, accum);
+#ifdef DEBUG
+                    printf("Thread %d: Row: %d, col: %d, col_sw: %d row offset: %d\n", threadIdx.x, row_act, col,
+                        col_sw, row_offset_act);
+                    printf("Thread %d: a: %f %f %f %f, b: %f %f accum: %f %f %f %f\n", threadIdx.x,
+                        __bfloat162float(a[0]), __bfloat162float(a[1]), __bfloat162float(a[2]), __bfloat162float(a[3]),
+                        __bfloat162float(b[0]), __bfloat162float(b[1]), accum[0], accum[1], accum[2], accum[3]);
+#endif
+                }
+            }
+
+            uint32_t bar_c = __cvta_generic_to_shared(&bar_data_consumed[stage]);
+            asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" : : "r"(bar_c));
+
+            stage = next_stage;
+            phase = next_phase;
+        }
+
+        float4 accum4;
+        accum4.x = accum[0];
+        accum4.y = accum[1];
+        accum4.z = accum[2];
+        accum4.w = accum[3];
+        reduction_buffer[threadIdx.x] = accum4;
+
+        __syncthreads();
+
+        if (pdlMode == TinyGemm2PdlReleaseAfterReduction)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+
+        if (warp_id == 0)
+        {
+
+            int mi = mib + warp_id * WARP_TILE_M;
+            int tm = mi + lane_id / 4;
+            int tn = ni + 2 * (lane_id % 4);
+
+            float4 accum1 = reduction_buffer[32 + threadIdx.x];
+            float4 accum2 = reduction_buffer[64 + threadIdx.x];
+            float4 accum3 = reduction_buffer[96 + threadIdx.x];
+
+            accum[0] = accum[0] + accum1.x + accum2.x + accum3.x;
+            accum[1] = accum[1] + accum1.y + accum2.y + accum3.y;
+            accum[2] = accum[2] + accum1.z + accum2.z + accum3.z;
+            accum[3] = accum[3] + accum1.w + accum2.w + accum3.w;
+
+            float bias_lo = __bfloat162float(sh_bias[tm - mib]);
+            float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
+
+            if (tn < N && tm < M)
+                output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
+            if (tn + 1 < N && tm < M)
+                output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
+            if (tn < N && tm + 8 < M)
+                output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
+            if (tn + 1 < N && tm + 8 < M)
+                output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
+
+            if (pdlMode == TinyGemm2PdlReleaseAfterStore && threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+
+            if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0)
+                profile[blockIdx.x].complete = gclock64();
+        }
+        if (pdlMode == TinyGemm2PdlReleaseAfterReduction)
+        {
+            __syncthreads();
         }
     }
 #endif // end if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)

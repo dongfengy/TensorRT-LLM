@@ -15,12 +15,42 @@
  */
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cstdlib>
+#include <cstring>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
 #include "tinygemm2_kernel.cuh"
+#include "tensorrt_llm/common/envUtils.h"
+
+namespace
+{
+
+int getTinyGemm2PdlMode()
+{
+    char const* mode = std::getenv("TRTLLM_TINYGEMM2_PDL_MODE");
+    if (mode == nullptr || std::strcmp(mode, "current") == 0 || mode[0] == '\0')
+    {
+        return TinyGemm2PdlCurrent;
+    }
+    if (std::strcmp(mode, "no_release") == 0)
+    {
+        return TinyGemm2PdlNoExplicitRelease;
+    }
+    if (std::strcmp(mode, "release_after_reduction") == 0)
+    {
+        return TinyGemm2PdlReleaseAfterReduction;
+    }
+    if (std::strcmp(mode, "release_after_store") == 0)
+    {
+        return TinyGemm2PdlReleaseAfterStore;
+    }
+    return TinyGemm2PdlCurrent;
+}
+
+} // namespace
 
 void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, __nv_bfloat16* bias, int batch_size,
     int output_features, int input_features, cudaStream_t stream)
@@ -61,9 +91,6 @@ void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, _
     int smem_size
         = STAGES * STAGE_UNROLL * (TILE_M * TILE_K * sizeof(__nv_bfloat16) + TILE_N * TILE_K * sizeof(__nv_bfloat16));
 
-    gpuErrChk(cudaFuncSetAttribute(tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
     int tiles_m = (output_features + TILE_M - 1) / TILE_M;
     int tiles_n = (batch_size + TILE_N - 1) / TILE_N;
 
@@ -79,11 +106,29 @@ void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, _
     config.stream = stream;
     config.attrs = attrs;
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    attrs[0].val.programmaticStreamSerializationAllowed
+        = tensorrt_llm::common::getEnvEnablePDLForKernel("TRTLLM_DISABLE_PDL_TINYGEMM2") ? 1 : 0;
     config.numAttrs = 1;
 
-    cudaLaunchKernelEx(&config, &tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>,
-        gC, gA, gB, bias, output_features, batch_size, input_features, weight_map, activation_map, nullptr);
+    int const pdlMode = getTinyGemm2PdlMode();
+    if (pdlMode == TinyGemm2PdlCurrent)
+    {
+        gpuErrChk(cudaFuncSetAttribute(
+            tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        cudaLaunchKernelEx(&config,
+            &tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>, gC, gA, gB, bias,
+            output_features, batch_size, input_features, weight_map, activation_map, nullptr);
+    }
+    else
+    {
+        gpuErrChk(cudaFuncSetAttribute(
+            tinygemm_kernel_pdl_experiment<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        cudaLaunchKernelEx(&config,
+            &tinygemm_kernel_pdl_experiment<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>, gC,
+            gA, gB, bias, output_features, batch_size, input_features, weight_map, activation_map, nullptr, pdlMode);
+    }
 }
 
 torch::Tensor tinygemm2_cuda_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias)

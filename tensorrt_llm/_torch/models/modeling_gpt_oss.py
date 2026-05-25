@@ -1,3 +1,4 @@
+import os
 from typing import Dict, Optional
 
 import torch
@@ -34,6 +35,8 @@ from .modeling_utils import DecoderModel, filter_weights, register_auto_model
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+DISABLE_GPT_OSS_TINYGEMM = os.environ.get(
+    "TRTLLM_DISABLE_GPT_OSS_TINYGEMM", "0") == "1"
 
 
 class AttentionBlock(Attention):
@@ -210,7 +213,8 @@ class MLPBlock(torch.nn.Module):
                             x: torch.Tensor,
                             lora_params: Optional[dict] = None) -> torch.Tensor:
         # Skip tinygemm2 optimization when LoRA is active (tinygemm2 doesn't support LoRA)
-        use_tinygemm = (get_sm_version() in [90, 100, 103]
+        use_tinygemm = (not DISABLE_GPT_OSS_TINYGEMM
+                        and get_sm_version() in [90, 100, 103]
                         and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS
                         and (lora_params is None or not bool(lora_params)))
 
