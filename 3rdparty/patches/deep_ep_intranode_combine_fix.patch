@@ -1,0 +1,24 @@
+--- a/csrc/kernels/intranode.cu
++++ b/csrc/kernels/intranode.cu
+@@ -818,2 +818,8 @@
+-                    for (int j = 0; j < num_topk_ranks; ++ j)
+-                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
++                    for (int j = 0; j < num_topk_ranks; ++ j) {
++                        int4* channel_x_buffer = nullptr;
++                        #pragma unroll
++                        for (int r = 0; r < kNumRanks; ++ r)
++                            if (topk_ranks[j] == r)
++                                channel_x_buffer = channel_x_buffers[r].buffer();
++                        recv_value_int4[j] = ld_nc_global(channel_x_buffer + slot_indices[j] * hidden_int4 + i);
++                    }
+@@ -873,2 +879,8 @@
+-                    for (int i = 0; i < num_topk_ranks; ++ i)
+-                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
++                    for (int i = 0; i < num_topk_ranks; ++ i) {
++                        float* channel_topk_weights_buffer = nullptr;
++                        #pragma unroll
++                        for (int r = 0; r < kNumRanks; ++ r)
++                            if (topk_ranks[i] == r)
++                                channel_topk_weights_buffer = channel_topk_weights_buffers[r].buffer();
++                        value += ld_nc_global(channel_topk_weights_buffer + slot_indices[i] * num_topk + lane_id);
++                    }
