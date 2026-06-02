@@ -5,6 +5,31 @@
 -                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
 +                    for (int j = 0; j < num_topk_ranks; ++ j)
 +                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[0].buffer() + (topk_ranks[j] * num_recv_buffer_tokens + slot_indices[j]) * hidden_int4 + i);
+@@ -846,7 +846,7 @@
+                     // Wait TMA arrival
+                     if (lane_id == 0)
+                         tma_store_wait<kNumStages - 1>();
+-                    __syncwarp();
++                    __syncwarp(__activemask());
+
+                     // Write into TMA buffer
+                     auto tma_stage_idx = (i / 32) % kNumStages;
+@@ -855,13 +855,13 @@
+
+                     // Issue TMA
+                     tma_store_fence();
+-                    __syncwarp();
++                    __syncwarp(__activemask());
+                     if (lane_id == 0) {
+                         auto tma_bytes = min(32, hidden_int4 - i) * static_cast<int>(sizeof(int4));
+                         tma_store_1d(reinterpret_cast<int4*>(tma_buffer) + tma_stage_idx * 32,
+                                      recv_int4 + token_idx * hidden_int4 + i, tma_bytes, false);
+                     }
+-                    __syncwarp();
++                    __syncwarp(__activemask());
+ #else
+                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
+ #endif
 @@ -873,2 +873,2 @@
 -                    for (int i = 0; i < num_topk_ranks; ++ i)
 -                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
