@@ -681,7 +681,8 @@ def run_disaggregated_test(example_dir,
                            model_path=None,
                            cwd=None,
                            disagg_schedule_style=None,
-                           post_client_test=None):
+                           post_client_test=None,
+                           server_start_timeout=300):
     """Run disaggregated test using service discovery instead of MPI."""
     if mpi_disabled():
         pytest.skip(
@@ -695,7 +696,8 @@ def run_disaggregated_test(example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             schedule_style=disagg_schedule_style)
+                             schedule_style=disagg_schedule_style,
+                             server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
 
@@ -716,19 +718,18 @@ def run_disaggregated_test(example_dir,
                             ] + [w.process for w in gen_workers]
 
         # run client tests
-        run_client_tests(
-            example_dir,
-            client_config_file,
-            test_desc,
-            num_iters,
-            run_env,
-            300,  # timeout
-            prompt_file,
-            extra_endpoints_test,
-            server_url,
-            all_worker_procs,
-            disagg_server.process,
-            use_ray=True)
+        run_client_tests(example_dir,
+                         client_config_file,
+                         test_desc,
+                         num_iters,
+                         run_env,
+                         server_start_timeout,
+                         prompt_file,
+                         extra_endpoints_test,
+                         server_url,
+                         all_worker_procs,
+                         disagg_server.process,
+                         use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
     finally:
@@ -2155,7 +2156,8 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            "gpt_oss_120b_harmony",
                            env=llm_venv._new_env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=7200)
 
 
 @pytest.mark.timeout(12600)
