@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import base64
 import json
@@ -90,7 +93,8 @@ from tensorrt_llm.visual_gen import VisualGen
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
-                              maybe_transform_reasoning_effort)
+                              maybe_transform_reasoning_effort,
+                              prepare_harmony_encoding_vocab)
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -388,6 +392,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self.use_harmony = False
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
+
+        if self.use_harmony:
+            prepare_harmony_encoding_vocab(hf_tokenizer_path)
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:

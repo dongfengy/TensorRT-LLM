@@ -1,11 +1,17 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: Apache-2.0
 
+import base64
+import hashlib
 import json
+import os
 import re
+import tempfile
 import time
 import traceback
 import uuid
+from pathlib import Path
 from typing import Any, List, Literal, Tuple
 
 from openai_harmony import (Author, Conversation, DeveloperContent,
@@ -29,6 +35,139 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               to_disaggregated_params)
 
 # yapf: enable
+
+_HARMONY_TIKTOKEN_ENV = "TIKTOKEN_ENCODINGS_BASE"
+_HARMONY_TIKTOKEN_FILENAME = "o200k_base.tiktoken"
+_HARMONY_TIKTOKEN_HASH = \
+    "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+_HARMONY_BASE_VOCAB_SIZE = 199998
+
+
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _gpt2_byte_decoder() -> dict[str, int]:
+    # Matches transformers.convert_slow_tokenizer.bytes_to_unicode without
+    # importing transformers during server startup.
+    visible_bytes = list(range(33, 127)) + list(range(161, 173)) + list(
+        range(174, 256))
+    byte_values = visible_bytes[:]
+    unicode_values = visible_bytes[:]
+    extra = 0
+    for byte_value in range(256):
+        if byte_value not in byte_values:
+            byte_values.append(byte_value)
+            unicode_values.append(256 + extra)
+            extra += 1
+    return {
+        chr(unicode_value): byte_value
+        for byte_value, unicode_value in zip(byte_values, unicode_values)
+    }
+
+
+def _write_harmony_tiktoken_vocab(tokenizer_json_path: Path,
+                                  output_dir: Path) -> Path:
+    with tokenizer_json_path.open(encoding="utf-8") as f:
+        tokenizer_json = json.load(f)
+
+    model = tokenizer_json.get("model", {})
+    if model.get("type") != "BPE":
+        raise ValueError("tokenizer.json model is not BPE")
+
+    vocab = model.get("vocab")
+    if not isinstance(vocab, dict):
+        raise ValueError("tokenizer.json does not contain a vocab dictionary")
+
+    rows: list[tuple[int, str]] = []
+    for token, rank in vocab.items():
+        if not isinstance(token, str) or not isinstance(rank, int):
+            continue
+        if rank < _HARMONY_BASE_VOCAB_SIZE:
+            rows.append((rank, token))
+    rows.sort()
+
+    if len(rows) != _HARMONY_BASE_VOCAB_SIZE:
+        raise ValueError(
+            f"expected {_HARMONY_BASE_VOCAB_SIZE} base vocab entries, "
+            f"found {len(rows)}")
+    for expected_rank, (rank, _) in enumerate(rows):
+        if rank != expected_rank:
+            raise ValueError(
+                f"tokenizer.json has non-contiguous base vocab rank {rank}; "
+                f"expected {expected_rank}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    vocab_path = output_dir / _HARMONY_TIKTOKEN_FILENAME
+    if (vocab_path.is_file()
+            and _sha256_file(vocab_path) == _HARMONY_TIKTOKEN_HASH):
+        return vocab_path
+
+    byte_decoder = _gpt2_byte_decoder()
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w",
+                                         encoding="utf-8",
+                                         dir=output_dir,
+                                         prefix="o200k_base.",
+                                         suffix=".tmp",
+                                         delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            for rank, token in rows:
+                try:
+                    token_bytes = bytes(byte_decoder[char] for char in token)
+                except KeyError as e:
+                    raise ValueError(
+                        f"tokenizer.json contains a non-ByteLevel token at "
+                        f"rank {rank}") from e
+                tmp_file.write(
+                    f"{base64.b64encode(token_bytes).decode('ascii')} "
+                    f"{rank}\n")
+
+        written_path = Path(tmp_path)
+        written_hash = _sha256_file(written_path)
+        if written_hash != _HARMONY_TIKTOKEN_HASH:
+            raise ValueError(
+                f"generated {_HARMONY_TIKTOKEN_FILENAME} hash {written_hash} "
+                f"does not match expected {_HARMONY_TIKTOKEN_HASH}")
+        os.replace(written_path, vocab_path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    return vocab_path
+
+
+def prepare_harmony_encoding_vocab(
+        pretrained_model_dir: str | os.PathLike[str] | None) -> None:
+    """Configure openai_harmony to load GPT-OSS vocab from local model assets."""
+    if os.getenv(_HARMONY_TIKTOKEN_ENV):
+        return
+    if not pretrained_model_dir:
+        return
+
+    tokenizer_json_path = Path(pretrained_model_dir) / "tokenizer.json"
+    if not tokenizer_json_path.is_file():
+        return
+
+    try:
+        cache_key = _sha256_file(tokenizer_json_path)[:16]
+        cache_dir = (Path(tempfile.gettempdir()) / "trtllm_harmony_tiktoken" /
+                     cache_key)
+        _write_harmony_tiktoken_vocab(tokenizer_json_path, cache_dir)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as e:
+        logger.warning(
+            "Failed to prepare local harmony vocab from %s: %s. "
+            "Falling back to openai_harmony default vocab loading.",
+            tokenizer_json_path, e)
+        return
+
+    os.environ[_HARMONY_TIKTOKEN_ENV] = str(cache_dir)
+    logger.info("Configured local harmony vocab directory: %s", cache_dir)
 
 
 def _check_channel_valid(generated_channels: List[str], channel: str) -> bool:

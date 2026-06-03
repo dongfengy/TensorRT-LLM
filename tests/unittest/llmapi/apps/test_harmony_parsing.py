@@ -22,12 +22,16 @@ Covers two fixes:
      - _merge_consecutive_deltas, cached_tokens in usage info, stream_options support.
 """
 
+import hashlib
 import json
+import os
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 
 try:
+    from tensorrt_llm.serve import harmony_adapter as harmony_adapter_module
     from tensorrt_llm.serve.harmony_adapter import (
         HarmonyAdapter,
         HarmonyStreamState,
@@ -35,6 +39,7 @@ try:
         _create_usage_info,
         get_harmony_adapter,
         handle_streaming_response,
+        prepare_harmony_encoding_vocab,
     )
     from tensorrt_llm.serve.openai_protocol import StreamOptions, _logit_bias_to_embedding_bias
     from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -103,6 +108,41 @@ def _make_mock_result(
     result._done = True
     result.cached_tokens = cached_tokens
     return result
+
+
+def test_prepare_harmony_encoding_vocab_generates_local_tiktoken(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    space_token = chr(288)
+    (model_dir / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "model": {
+                    "type": "BPE",
+                    "vocab": {
+                        "!": 0,
+                        space_token: 1,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    expected_vocab = b"IQ== 0\nIA== 1\n"
+    monkeypatch.setattr(harmony_adapter_module, "_HARMONY_BASE_VOCAB_SIZE", 2)
+    monkeypatch.setattr(
+        harmony_adapter_module, "_HARMONY_TIKTOKEN_HASH", hashlib.sha256(expected_vocab).hexdigest()
+    )
+    monkeypatch.setattr(
+        harmony_adapter_module.tempfile, "gettempdir", lambda: str(tmp_path / "cache")
+    )
+    monkeypatch.delenv("TIKTOKEN_ENCODINGS_BASE", raising=False)
+
+    prepare_harmony_encoding_vocab(str(model_dir))
+
+    vocab_dir = Path(os.environ["TIKTOKEN_ENCODINGS_BASE"])
+    assert (vocab_dir / "o200k_base.tiktoken").read_bytes() == expected_vocab
 
 
 # ===========================================================================
