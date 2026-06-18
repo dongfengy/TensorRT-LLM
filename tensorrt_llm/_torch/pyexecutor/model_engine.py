@@ -1131,6 +1131,21 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
+        # The C++ TRTLLM-Gen FMHA JIT warmup enumerates a (batchSize x seqLenKv) cartesian
+        # grid sized by engine maxima (PR #14851/#15305). For long-context configs such as
+        # GPT-OSS-120B test_w4_4gpus[v1_kv_cache-ep4-trtllm-auto] (max_batch_size=720,
+        # max_seq_len=131072), the densified grid pushes warmup TMA descriptor shapes past
+        # the flashinfer 2^32 limit (kernelParams.h:598) and aborts engine startup. Skip
+        # the warmup whenever the maxima product is too large; any kernel not pre-warmed
+        # JIT-compiles lazily on first request, which is correct (just slower for that one
+        # request). The threshold matches the pre-PR #15305 effective grid size.
+        if self.batch_size * self.max_seq_len > 256 * 16384:
+            logger.info(
+                f"Skipping TRTLLM-Gen FMHA JIT warmup: engine config "
+                f"(max_batch_size={self.batch_size}, max_seq_len={self.max_seq_len}) "
+                f"would produce too many warmup grid points")
+            return
+
         @contextlib.contextmanager
         def trtllm_gen_fmha_jit_warmup():
             previous = self._trtllm_gen_jit_warmup
