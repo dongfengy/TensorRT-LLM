@@ -402,6 +402,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     MAX_HEADS_RATIO_GENERATION = 32
     MIN_TOKENS_PER_BLOCK = 8
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
+    # flashinfer's buildNdTmaDescriptor (kernelParams.h:598) enforces shapes[ii] <= 2^32.
+    # Use a conservative request-token guard before descriptor construction. The failing
+    # GPT-OSS-120B config has K/V width 2 * num_kv_heads * head_dim = 2 * 8 * 64
+    # = 1024 elements per request-token, so 2^32 / 1024 = 4,194,304 request-tokens.
+    # Express that as 256 * 16K to match TRTLLM-Gen FMHA warmup grid candidates.
+    # Oversized configs fall back/skip warmup to avoid one-rank abort and NCCL hang.
+    MAX_TMA_GUARD_THRESHOLD = 256 * 16384
     SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
         (320, 256),
         (576, 512),
@@ -627,6 +634,17 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         if meta.kv_cache_block_offsets is None:
             return False, "trtllm-gen requires paged KV cache."
+
+        # See MAX_TMA_GUARD_THRESHOLD: oversized engine maxima would overflow flashinfer's
+        # TMA shape limit. Fall back to thop.attention, whose runtime is unaffected.
+        if meta.max_num_requests * meta.max_seq_len > self.MAX_TMA_GUARD_THRESHOLD:
+            return (
+                False,
+                f"engine maxima product (max_num_requests={meta.max_num_requests} * "
+                f"max_seq_len={meta.max_seq_len} = "
+                f"{meta.max_num_requests * meta.max_seq_len}) exceeds TRTLLM-Gen FMHA "
+                f"TMA guard threshold ({self.MAX_TMA_GUARD_THRESHOLD}).",
+            )
         output = fwd.output
         if output is None:
             return False, "trtllm-gen requires output."
