@@ -35,6 +35,8 @@ from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
+from ..attention_backend.fmha.flashinfer_trtllm_gen import \
+    FlashInferTrtllmGenFmha
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
@@ -1131,15 +1133,12 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
-        # The C++ TRTLLM-Gen FMHA JIT warmup enumerates a (batchSize x seqLenKv) cartesian
-        # grid sized by engine maxima (PR #14851/#15305). For long-context configs such as
-        # GPT-OSS-120B test_w4_4gpus[v1_kv_cache-ep4-trtllm-auto] (max_batch_size=720,
-        # max_seq_len=131072), the densified grid pushes warmup TMA descriptor shapes past
-        # the flashinfer 2^32 limit (kernelParams.h:598) and aborts engine startup. Skip
-        # the warmup whenever the maxima product is too large; any kernel not pre-warmed
-        # JIT-compiles lazily on first request, which is correct (just slower for that one
-        # request). The threshold matches the pre-PR #15305 effective grid size.
-        if self.batch_size * self.max_seq_len > 256 * 16384:
+        # The C++ TRTLLM-Gen FMHA JIT warmup enumerates a (batchSize x seqLenKv) grid
+        # sized by engine maxima (PR #14851/#15305) and would overflow the flashinfer
+        # 2^32 TMA shape limit on long-context configs (nvbugs/6316980). Skip warmup
+        # past the same threshold is_supported() uses; any kernel not pre-warmed
+        # JIT-compiles lazily on first request.
+        if self.batch_size * self.max_seq_len > FlashInferTrtllmGenFmha.MAX_TMA_GUARD_THRESHOLD:
             logger.info(
                 f"Skipping TRTLLM-Gen FMHA JIT warmup: engine config "
                 f"(max_batch_size={self.batch_size}, max_seq_len={self.max_seq_len}) "
