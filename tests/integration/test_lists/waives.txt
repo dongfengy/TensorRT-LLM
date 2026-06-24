@@ -159,8 +159,6 @@ full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_
 full:GB200/disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff SKIP (https://nvbugs/6369254)
 full:GB300/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-False-False] SKIP (https://nvbugs/6316984)
 full:GB300/accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm] SKIP (https://nvbugs/6329165)
-full:GB300/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-trtllm-fp8] SKIP (https://nvbugs/6316980)
-full:GB300/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache_no_reuse-tp4-trtllm-fp8] SKIP (https://nvbugs/6316980)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8_moe_dflash SKIP (https://nvbugs/6316985)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_trtllm] SKIP (https://nvbugs/6317600)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash SKIP (https://nvbugs/6344883)
