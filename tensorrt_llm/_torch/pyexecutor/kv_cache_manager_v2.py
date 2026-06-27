@@ -1074,6 +1074,15 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return self.impl.get_page_index_upper_bound(0, Role.KEY)
 
+    def get_primary_pool_page_index_upper_bound(self) -> int:
+        """Return the exclusive upper bound for flattened primary-pool page indices.
+
+        KV-cache V2 page indices already encode the layer and K/V-role offsets. Consumers that
+        wrap the pool as a flat page tensor must use this bound directly instead of scaling it by
+        the number of local layers or the K/V factor.
+        """
+        return self.blocks_in_primary_pool
+
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY)
