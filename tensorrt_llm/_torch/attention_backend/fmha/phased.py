@@ -83,12 +83,6 @@ class PhasedFmha(Fmha):
         if kv_cache_manager is None:
             return 0
 
-        get_page_index_upper_bound = getattr(
-            kv_cache_manager, "get_primary_pool_page_index_upper_bound", None
-        )
-        if get_page_index_upper_bound is not None:
-            return int(get_page_index_upper_bound())
-
         blocks_in_primary_pool = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
         if blocks_in_primary_pool is None:
             blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)

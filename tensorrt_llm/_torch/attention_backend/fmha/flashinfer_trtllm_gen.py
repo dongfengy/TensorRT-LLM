@@ -421,6 +421,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
 
+    def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is not None:
+            page_index_upper_bound = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
+            # KVCacheManagerV2 reports an already-flattened page-index upper bound here,
+            # so this branch must bypass the legacy layer/KV scaling.
+            if page_index_upper_bound is not None:
+                return int(page_index_upper_bound)
+        return super()._get_total_num_blocks(meta)
+
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
         if not IS_FLASHINFER_AVAILABLE:
