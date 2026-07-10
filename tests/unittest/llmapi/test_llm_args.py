@@ -1414,17 +1414,18 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        is True (and stays `None` otherwise). The fixed list keeps the
        capture set small to bound startup time and CUDA graph memory;
        the model-engine filter (invariants 2 and 3) ensures the largest
-       reachable size is always captured even when it is not in this
-       default list.
+       reachable size is captured when it is cheap to pad to, even when
+       it is not in this default list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
        `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
        least one decode token.
-    3. The reachable ceiling itself is always present in the returned
-       capture set (when positive), so runtime ISLs in the gap between
-       the next-largest candidate and the ceiling get a graph rather
-       than falling back to eager.
+    3. The reachable ceiling itself is present in the returned capture
+       set when it is positive and within the padding-waste guard of the
+       largest surviving candidate: the small-gap append keeps NVBug
+       5615248 fixed, while far ceilings are not appended because padding
+       to them costs more GPU time than eager execution (NVBug 6404567).
     """
 
     _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
@@ -1480,6 +1481,63 @@ class TestPiecewiseCudaGraphCaptureDefaults:
                 enable_piecewise_cuda_graph=True),
         )
         assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+
+    def test_piecewise_filter_skips_far_ceiling_append(self):
+        """Do not force-append a ceiling far above the largest candidate.
+
+        NVBug 6404567: with the gpt-oss-120b GB300 serving config
+        (max_num_tokens=65536, max_batch_size=896, max_seq_len=32768,
+        `capture_num_tokens` topping out at 13914), appending the 65536
+        ceiling made runtime padding execute every (13914, 65536]-token
+        iteration as the 65536-token graph -- up to ~4.7x wasted device
+        time and ~12% end-to-end throughput loss. Far ceilings must not
+        be appended.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = [512, 1024, 2048, 4096, 8192, 13914]
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=65536,
+            max_batch_size=896,
+            max_seq_len=32768,
+        )
+        assert kept == candidates
+        assert 65536 not in kept
+        assert unrecordable == []
+
+    def test_piecewise_filter_appends_ceiling_within_guard(self):
+        """A ceiling just above the largest candidate is still appended.
+
+        This is the NVBug 5615248 regime: the gap between the largest
+        candidate and the ceiling is tiny (well within the absolute
+        padding allowance), and capturing the ceiling keeps gap ISLs on
+        the piecewise graph instead of eager.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+        )
+        assert kept[-1] == 127
+        assert unrecordable == []
+
+    def test_piecewise_padding_guard_boundaries(self):
+        """Absolute allowance covers tiny shapes; ratio bounds large ones."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _piecewise_padding_within_guard
+
+        assert _piecewise_padding_within_guard(65, 127)
+        assert _piecewise_padding_within_guard(2900, 3072)
+        assert _piecewise_padding_within_guard(60000, 65536)
+        assert not _piecewise_padding_within_guard(13915, 65536)
+        assert not _piecewise_padding_within_guard(1024, 2048)
 
     def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
         """Drop candidates above `max_batch_size * (max_seq_len - 1)`.
@@ -1610,9 +1668,17 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert kept == []
         assert unrecordable == [1, 2, 4]
 
-    def test_piecewise_filter_appends_ceiling_when_only_smaller_candidates(
+    def test_piecewise_filter_skips_ceiling_when_only_far_smaller_candidates(
             self):
-        """No candidate near the ceiling -> ceiling still appended."""
+        """No candidate near the ceiling -> ceiling NOT appended.
+
+        Previously the ceiling (1016 here) was appended unconditionally,
+        which made runtime padding round every 9..1016-token iteration up
+        to the 1016-token graph. Under the padding-waste guard the append
+        requires the ceiling to be within 256 tokens or 1.25x of the
+        largest candidate (8 here), so nothing is appended and those
+        iterations run eagerly at true size (NVBug 6404567).
+        """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
 
@@ -1622,8 +1688,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_batch_size=8,
             max_seq_len=128,
         )
-        # Ceiling: 8 * (128 - 1) = 1016.
-        assert kept == [1, 2, 4, 8, 1016]
+        # Ceiling: 8 * (128 - 1) = 1016 -- far above max candidate 8.
+        assert kept == [1, 2, 4, 8]
 
 
 class TestTrtLlmArgs:

@@ -113,6 +113,26 @@ class ModelEngine(ABC):
         return
 
 
+# Guard on padding waste when rounding an iteration's token count up to a
+# captured piecewise CUDA graph size. Replaying a captured graph executes
+# the full captured shape, so padding waste is real GPU work: rounding a
+# ~14k-token iteration up to a 65536-token graph costs roughly the full
+# 65536-token execution time (NVBug 6404567). The absolute allowance keeps
+# tiny, launch-bound shapes padding freely (NVBug 5615248); the relative
+# bound caps waste on large, compute-bound shapes.
+_PIECEWISE_PAD_MAX_ABS_TOKENS = 256
+_PIECEWISE_PAD_MAX_RATIO = 1.25
+
+
+def _piecewise_padding_within_guard(num_tokens: int,
+                                    padded_num_tokens: int) -> bool:
+    """True if padding `num_tokens` up to `padded_num_tokens` wastes little
+    enough that replaying the padded piecewise graph is preferable to eager
+    execution."""
+    return (padded_num_tokens - num_tokens <= _PIECEWISE_PAD_MAX_ABS_TOKENS
+            or padded_num_tokens <= num_tokens * _PIECEWISE_PAD_MAX_RATIO)
+
+
 def _filter_piecewise_capture_num_tokens(
     candidate_num_tokens: list[int],
     max_num_tokens: int,
@@ -122,7 +142,7 @@ def _filter_piecewise_capture_num_tokens(
 ) -> Tuple[list[int], list[int]]:
     """Cap piecewise CUDA graph capture candidates at the engine's reachable
     `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
-    and ensure the ceiling itself is captured.
+    and, when it is cheap to pad to, capture the ceiling itself.
 
     Each in-flight request must leave room for at least one decode token,
     so the ceiling is the largest forward-pass `num_tokens` the warmup
@@ -131,8 +151,11 @@ def _filter_piecewise_capture_num_tokens(
     (otherwise ISLs in that gap have no graph >= them and fall back to
     eager).
 
-    Returns `(kept, unrecordable)` where `kept` is sorted ascending,
-    deduped, and contains the ceiling whenever it is positive.
+    Returns `(kept, unrecordable)` where `kept` is sorted ascending and
+    deduped; it contains the ceiling when the ceiling is positive and
+    within `_piecewise_padding_within_guard` of the largest candidate
+    (padding a mid-size iteration to a far larger ceiling costs more GPU
+    time than eager execution, NVBug 6404567).
     `unrecordable` is the sorted unique set of input entries above the
     ceiling but within `max_num_tokens`.
     """
@@ -142,8 +165,10 @@ def _filter_piecewise_capture_num_tokens(
     kept = sorted(
         {i
          for i in candidate_num_tokens if 0 < i <= piecewise_capacity_limit})
-    if piecewise_capacity_limit > 0 and (not kept or kept[-1]
-                                         < piecewise_capacity_limit):
+    if piecewise_capacity_limit > 0 and (
+            not kept or (kept[-1] < piecewise_capacity_limit
+                         and _piecewise_padding_within_guard(
+                             kept[-1] + 1, piecewise_capacity_limit))):
         kept.append(piecewise_capacity_limit)
     unrecordable = sorted({
         i
@@ -474,8 +499,8 @@ class PyTorchModelEngine(ModelEngine):
                 f"{unrecordable}: exceeds reachable ceiling "
                 f"max_batch_size*(max_seq_len-1-num_extra_decoding_steps)="
                 f"{max(0, self.batch_size * (self.max_seq_len - 1 - num_extra_decoding_steps))}. "
-                f"Capturing the ceiling itself; raise max_seq_len for larger graphs."
-            )
+                f"Sizes above the largest captured graph run eagerly; "
+                f"raise max_seq_len for larger graphs.")
 
         try:
             use_ub_for_nccl = (
