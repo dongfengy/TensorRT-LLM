@@ -952,8 +952,21 @@ class SpecWorkerBase(nn.Module, ABC):
                     attn_metadata = a
                 elif spec_metadata is None and isinstance(a, SpecMetadata):
                     spec_metadata = a
-        try:
+        with self._spec_dec_state_scope(attn_metadata, spec_metadata):
             return self._forward_impl(*args, **kwargs)
+
+    @contextmanager
+    def _spec_dec_state_scope(self, attn_metadata, spec_metadata):
+        """Restore spec-dec metadata state on scope exit, success or failure.
+
+        The scope intentionally does NOT run prepare_for_spec_dec on enter:
+        workers prepare at their preferred point inside _forward_impl, and a
+        failure inside prepare itself (e.g. an OOM in the clone calls) must
+        still reach the cleanup, which a prepare-on-enter context manager
+        would not guarantee.
+        """
+        try:
+            yield
         finally:
             self._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
 
