@@ -284,7 +284,129 @@ public:
         }
     }
 
+    // FP32-through variant: the reduction result arrives as fp32 (one float per DType
+    // lane). Residual add and RMSNorm run in fp32; every output tensor is rounded to
+    // DType exactly once. This removes the intermediate DType rounding of the reduced
+    // sum, which dominates the error on large-magnitude (outlier) channels.
+    __device__ __forceinline__ void operator()(float* v, int token_id)
+    {
+        if constexpr (HasAllReduceOut<Pattern>)
+        {
+            float4 ar_out;
+#pragma unroll
+            for (int i = 0; i < kMathCount; ++i)
+            {
+                reinterpret_cast<DType*>(&ar_out)[i] = static_cast<DType>(v[i]);
+            }
+            reinterpret_cast<float4*>(m_params.allreduce_out)[m_access_id] = ar_out;
+        }
+        if constexpr (HasResidual<Pattern>)
+        {
+#pragma unroll
+            for (int i = 0; i < kMathCount; ++i)
+            {
+                v[i] += static_cast<float>(reinterpret_cast<DType const*>(&m_residual_val)[i]);
+            }
+            if constexpr (HasResidualOut<Pattern>)
+            {
+                float4 res_out;
+#pragma unroll
+                for (int i = 0; i < kMathCount; ++i)
+                {
+                    reinterpret_cast<DType*>(&res_out)[i] = static_cast<DType>(v[i]);
+                }
+                reinterpret_cast<float4*>(m_params.residual_out)[m_access_id] = res_out;
+            }
+        }
+        float4 val;
+        if constexpr (HasRMSNorm<Pattern>)
+        {
+            val = rms_norm_fp32(v);
+            if constexpr (HasNormOut<Pattern>)
+            {
+                reinterpret_cast<float4*>(m_params.norm_out)[m_access_id] = val;
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int i = 0; i < kMathCount; ++i)
+            {
+                reinterpret_cast<DType*>(&val)[i] = static_cast<DType>(v[i]);
+            }
+        }
+        if constexpr (GetQuantType<Pattern> == QuantType::kFP4)
+        {
+            constexpr int SF_VEC_SIZE = 16;
+            using PackedVec = PackedVec<DType>;
+            PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, token_id, m_access_id_in_token,
+                std::nullopt, m_params.hidden_dim / SF_VEC_SIZE, reinterpret_cast<uint32_t*>(m_params.scale_out),
+                m_params.layout);
+            reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
+                = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
+        }
+        else if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
+        {
+            using PackedQuantizedType = std::conditional_t<std::is_same_v<DType, float>, float, float2>;
+            PackedQuantizedType ret;
+#pragma unroll
+            for (int i = 0; i < kMathCount; ++i)
+            {
+                reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
+                    static_cast<float>(reinterpret_cast<DType*>(&val)[i]) * m_scale_factor);
+            }
+            reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
+        }
+    }
+
 protected:
+    __device__ __forceinline__ float4 rms_norm_fp32(float const* v)
+    {
+        __shared__ float s_val;
+        float4 norm_out;
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < kMathCount; ++i)
+        {
+            acc += v[i] * v[i];
+        }
+        tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        namespace cg = cooperative_groups;
+        cg::cluster_group cluster = cg::this_cluster();
+        if (cluster.num_blocks() > 1)
+        {
+            if (threadIdx.x == 0)
+            {
+                s_val = acc;
+                acc = 0.f;
+            }
+            cluster.sync();
+            if (threadIdx.x == 0)
+            {
+                for (int i = 0; i < cluster.num_blocks(); ++i)
+                {
+                    acc += *cluster.map_shared_rank(&s_val, i);
+                }
+            }
+            cluster.sync();
+        }
+#endif
+        if (threadIdx.x == 0)
+        {
+            s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < kMathCount; ++i)
+        {
+            reinterpret_cast<DType*>(&norm_out)[i] = static_cast<DType>(
+                v[i] * s_val * static_cast<float>(reinterpret_cast<DType const*>(&m_gamma_val)[i]));
+        }
+        return norm_out;
+    }
+
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
         __shared__ float s_val;
@@ -412,6 +534,26 @@ __device__ __forceinline__ float4 allreduce_sum(float4* vals)
     }
 }
 
+template <typename DType, int NRanks>
+__device__ __forceinline__ void allreduce_sum_to_fp32(float4* vals, float* acc_f32)
+{
+    static_assert(true, "");
+#pragma unroll
+    for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+    {
+        acc_f32[i] = static_cast<float>(reinterpret_cast<DType*>(&vals[0])[i]);
+    }
+#pragma unroll
+    for (int r = 1; r < NRanks; ++r)
+    {
+#pragma unroll
+        for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+        {
+            acc_f32[i] += static_cast<float>(reinterpret_cast<DType*>(&vals[r])[i]);
+        }
+    }
+}
+
 template <typename DType>
 class IndexHelper
 {
@@ -509,8 +651,17 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
                 done &= !is_neg_zero(vals[r]);
             }
         }
-        float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
-        fused_op(sum_val, tidx);
+        if constexpr (Fp32Acc)
+        {
+            float acc_f32[kElemsPerAccess<DType>];
+            allreduce_sum_to_fp32<DType, NRanks>(vals, acc_f32);
+            fused_op(acc_f32, tidx);
+        }
+        else
+        {
+            float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
+            fused_op(sum_val, tidx);
+        }
     }
 
     comm.update(params.size * NRanks);
@@ -718,9 +869,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 
 bool use_fp32_acc()
 {
-    // we use fp16 acc type by default due to keep align with nccl
+    // FP32 accumulation is the default: native-dtype accumulation measurably hurts
+    // accuracy on models with large residual-stream outliers (https://nvbugs/6450338).
+    // Opt out with ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0 to restore the legacy behavior.
     static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
-    return fp32_acc != nullptr;
+    return fp32_acc == nullptr || fp32_acc[0] != '0';
 }
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
