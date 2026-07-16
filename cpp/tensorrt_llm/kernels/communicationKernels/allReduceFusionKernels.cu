@@ -242,10 +242,48 @@ public:
         if constexpr (HasResidual<Pattern>)
         {
             val = add128<DType>(val, m_residual_val);
-            if constexpr (HasResidualOut<Pattern>)
+        }
+        epilogue(val, token_id);
+    }
+
+    // FP32-accumulation entry point (oneshot): `v` holds the unrounded fp32
+    // reduction result, one float per DType lane. The residual is added in fp32
+    // and the value is rounded to DType exactly once, so large-magnitude
+    // (outlier) channels do not pay the intermediate rounding of the reduced
+    // sum.
+    __device__ __forceinline__ void operator()(float* v, int token_id)
+    {
+        float4 val;
+        if constexpr (HasAllReduceOut<Pattern>)
+        {
+#pragma unroll
+            for (int i = 0; i < kMathCount; ++i)
             {
-                reinterpret_cast<float4*>(m_params.residual_out)[m_access_id] = val;
+                reinterpret_cast<DType*>(&val)[i] = static_cast<DType>(v[i]);
             }
+            reinterpret_cast<float4*>(m_params.allreduce_out)[m_access_id] = val;
+        }
+        if constexpr (HasResidual<Pattern>)
+        {
+#pragma unroll
+            for (int i = 0; i < kMathCount; ++i)
+            {
+                v[i] += static_cast<float>(reinterpret_cast<DType const*>(&m_residual_val)[i]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kMathCount; ++i)
+        {
+            reinterpret_cast<DType*>(&val)[i] = static_cast<DType>(v[i]);
+        }
+        epilogue(val, token_id);
+    }
+
+    __device__ __forceinline__ void epilogue(float4 val, int token_id)
+    {
+        if constexpr (HasResidual<Pattern> && HasResidualOut<Pattern>)
+        {
+            reinterpret_cast<float4*>(m_params.residual_out)[m_access_id] = val;
         }
         if constexpr (HasRMSNorm<Pattern>)
         {
@@ -509,8 +547,30 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
                 done &= !is_neg_zero(vals[r]);
             }
         }
-        float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
-        fused_op(sum_val, tidx);
+        if constexpr (Fp32Acc)
+        {
+            float acc_f32[kElemsPerAccess<DType>];
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+            {
+                acc_f32[i] = static_cast<float>(reinterpret_cast<DType*>(&vals[0])[i]);
+            }
+#pragma unroll
+            for (int r = 1; r < NRanks; ++r)
+            {
+#pragma unroll
+                for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+                {
+                    acc_f32[i] += static_cast<float>(reinterpret_cast<DType*>(&vals[r])[i]);
+                }
+            }
+            fused_op(acc_f32, tidx);
+        }
+        else
+        {
+            float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
+            fused_op(sum_val, tidx);
+        }
     }
 
     comm.update(params.size * NRanks);
@@ -718,9 +778,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 
 bool use_fp32_acc()
 {
-    // we use fp16 acc type by default due to keep align with nccl
+    // FP32 accumulation is the default: native-dtype accumulation measurably hurts
+    // accuracy on models with large residual-stream outliers.
+    // Opt out with ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0 to restore the legacy behavior.
     static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
-    return fp32_acc != nullptr;
+    return fp32_acc == nullptr || fp32_acc[0] != '0';
 }
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
