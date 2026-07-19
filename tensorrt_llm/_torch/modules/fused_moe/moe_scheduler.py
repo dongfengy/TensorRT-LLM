@@ -635,9 +635,19 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
                     input_ids_list[idx_chunk] = input_ids_list[0]
-                    all_rank_num_tokens_list[idx_chunk][moe.mapping.tp_rank] = (
-                        all_rank_num_tokens_list[0][moe.mapping.tp_rank]
-                    )
+            # The sizes vectors feed varsize allgather/reducescatter on the TP
+            # group, so every rank must hold the IDENTICAL vector for each
+            # chunk. Apply the substitution for EVERY rank whose chunk is
+            # empty (each rank resends its chunk 0 in that case, and peers can
+            # derive that deterministically from all_rank_chunk_size_list) —
+            # updating only the local rank's entry desynchronizes the
+            # collective sizes across ranks and deadlocks multi-node
+            # attention-DP (each rank posts a different total count).
+            for idx_chunk in range(num_chunks):
+                vec = all_rank_num_tokens_list[idx_chunk]
+                for j in range(len(vec)):
+                    if all_rank_chunk_size_list[j][idx_chunk] == 0:
+                        vec[j] = all_rank_chunk_size_list[j][0]
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
             input_ids_list = tuple(input_ids_list)
