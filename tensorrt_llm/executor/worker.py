@@ -3,7 +3,7 @@ import os
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 
@@ -254,7 +254,7 @@ def worker_main(
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
-            # processes, each one is a PAIR zmq socket
+            # threads, each one is a PAIR zmq socket
             result_queues = [
                 FusedIpcQueue(is_server=True,
                               fuse_message=False,
@@ -302,7 +302,9 @@ def worker_main(
                               [worker_queues.result_queue_addr])
 
         assert result_queues is not None
-        postproc_worker_pool = ProcessPoolExecutor(
+        # Forking after MPI/runtime initialization can crash children and
+        # leave rank 0 blocked on their orphaned ZeroMQ feed sockets.
+        postproc_worker_pool = ThreadPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
