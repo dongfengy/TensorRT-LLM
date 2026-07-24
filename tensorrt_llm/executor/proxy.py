@@ -121,6 +121,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         )
 
         self.workers_started = False
+        self._deferred_request_shutdown = False
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
@@ -456,7 +457,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                                           name="proxy_request_queue")
             # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
             # Use PULL mode when enable_postprocess_parallel as there are
-            # multiple senders from multiple processes.
+            # multiple senders from supervised postprocessing threads.
             self.result_queue = FusedIpcQueue(
                 is_server=True,
                 fuse_message=False,
@@ -535,6 +536,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             f"Postprocessing worker {fatal.worker_id} failed with "
             f"{fatal.error_type}: {fatal.error_message}\n{fatal.traceback}")
         logger.error(str(error))
+        # This runs on the result queue's owning dispatch thread. Recording the
+        # fatal error wakes all pending clients. Fatal-aware pre_shutdown only
+        # closes monitors and flips thread-safe state; it must not touch the
+        # request queue from this non-owning thread.
         self._set_fatal_error(error)
         if not self.doing_shutdown:
             self.pre_shutdown()
@@ -543,6 +548,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         error = RuntimeError(
             "Postprocessing result lane closed before proxy shutdown")
         logger.error(str(error))
+        # See _handle_postproc_worker_fatal: the dispatcher owns only the
+        # result socket, so fatal-aware pre_shutdown must skip request sends.
         self._set_fatal_error(error)
         if not self.doing_shutdown:
             self.pre_shutdown()
@@ -720,14 +727,26 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if self.doing_shutdown:
             return
-        else:
-            self.doing_shutdown = True
+        fatal_shutdown = self._engine_dead or self._fatal_error is not None
+        # Publish deferred socket work before doing_shutdown. A concurrent
+        # owner-thread shutdown that observes doing_shutdown must also observe
+        # the deferred action.
+        if fatal_shutdown:
+            self._deferred_request_shutdown = True
+        self.doing_shutdown = True
 
         self._worker_process_monitor.close()
 
         # Wake the error monitor thread immediately so it exits cleanly
         if hasattr(self, '_shutdown_event'):
             self._shutdown_event.set()
+
+        # Fatal propagation already poisoned every pending GenerationResult.
+        # The peer may be dead, and this method can be reached from a monitor
+        # or result-dispatch thread, so do not use the thread-affine request
+        # socket. Normal owner-thread shutdown retains abort and sentinel sends.
+        if fatal_shutdown:
+            return
 
         self._abort_all_requests()
 
@@ -749,6 +768,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         # case (a); keep both behaviours explicit.
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
+
+    def _complete_deferred_request_shutdown(self) -> None:
+        """Send a fatal-path shutdown sentinel from the socket owner thread."""
+        if not self._deferred_request_shutdown:
+            return
+        self._deferred_request_shutdown = False
+        try:
+            # The peer may already be gone, so this completion must remain
+            # bounded. It is still needed when a proxy-local fatal leaves a
+            # healthy worker waiting for requests.
+            self.request_queue.put_noblock(None, retry=4)
+        except Exception as error:  # noqa: BLE001 - best-effort fatal cleanup
+            logger.debug(f"Deferred worker shutdown sentinel failed (ignored): "
+                         f"{error!r}")
 
     def _get_next_client_id(self) -> int:
         client_id = super()._get_next_client_id()
@@ -776,6 +809,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if not self.doing_shutdown:
             self.pre_shutdown()
+        self._complete_deferred_request_shutdown()
 
         logger_debug('Proxy.shutdown...\n', "yellow")
 
@@ -1124,6 +1158,7 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         # stays empty and worker death reaches this frontend through its
         # result lane / error queue instead.
         self._engine_dead = False
+        self._deferred_request_shutdown = False
         self.model_world_size = attach_info.get("model_world_size", 1)
         self._worker_process_monitor = WorkerProcessMonitor()
 
@@ -1184,14 +1219,42 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
     def pre_shutdown(self):
         if self.doing_shutdown:
             return
+        fatal_shutdown = self._engine_dead or self._fatal_error is not None
+        # Publish deferred socket work before doing_shutdown; see the launcher
+        # implementation for the concurrent shutdown ordering contract.
+        if fatal_shutdown:
+            self._deferred_request_shutdown = True
         self.doing_shutdown = True
+        # Fatal propagation already wakes this frontend's pending requests.
+        # The inherited handler runs on the result-dispatch thread, which must
+        # not send aborts through the request socket owned by the caller thread.
+        if fatal_shutdown:
+            return
         # Abort this frontend's in-flight requests so the engine frees their
         # slots. Never send the None engine-shutdown sentinel: the launcher
         # frontend owns the engine lifecycle (see the class docstring).
         self._abort_all_requests()
 
+    def _complete_deferred_request_shutdown(self) -> None:
+        """Send bounded fatal-path aborts from the request socket owner."""
+        if not self._deferred_request_shutdown:
+            return
+        self._deferred_request_shutdown = False
+        # Pending clients are already poisoned with EngineDeadError. These
+        # best-effort cancellations only free slots if the shared engine is
+        # still healthy after a proxy-local fatal; never block if it is dead.
+        for request_id in list(self._results):
+            try:
+                self.request_queue.put_noblock(CancellingRequest(request_id),
+                                               retry=4)
+            except Exception as error:  # noqa: BLE001 - best-effort fatal cleanup
+                logger.debug(
+                    f"Deferred request {request_id} cancellation failed "
+                    f"(ignored): {error!r}")
+
     def shutdown(self):
         self.pre_shutdown()
+        self._complete_deferred_request_shutdown()
         if self.rpc_client is not None:
             self.rpc_client.close()
             self.rpc_client = None

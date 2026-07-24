@@ -256,7 +256,7 @@ class BaseWorker(GenerationExecutor):
         self.result_queue = queue
 
     def set_postproc_queues(self, queues: List["IpcQueue"]):
-        """ Set the IPC queues for feeding post-processing processes. """
+        """Set the IPC queues for feeding postprocessing worker threads."""
         assert self.result_queue is None
         assert self.frontend_result_queues is None
         self.postproc_queues = queues
@@ -1422,8 +1422,8 @@ def _send_rsp(
             _get_params_for_first_rsp(worker, response.client_id))
         inp = PostprocWorker.Input(
             response,
-            # sampling_params is necessary for creating fake GenerationResult
-            # instances in the postproc processes. They are for incremental
+            # sampling_params is necessary for creating GenerationResult
+            # instances in the postprocessing workers. They are for incremental
             # detokenize. They should be transmitted only once for each
             # Request.
             sampling_params=sampling_params,

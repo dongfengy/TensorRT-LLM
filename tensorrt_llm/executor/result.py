@@ -230,7 +230,7 @@ class GenerationResultBase:
 
         # This is used for avoid duplicate transmission the sampling_params for a
         # request. SamplingParams is necessary for creating dummy
-        # GenerationResultBase instances on postprocess worker processes.
+        # GenerationResultBase instances in postprocessing worker threads.
         self._params_transmitted = False
 
     def abort(self) -> None:

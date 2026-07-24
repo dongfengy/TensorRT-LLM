@@ -104,6 +104,7 @@ class PostprocWorker:
         post_processor_hook: Optional[str] = None,
         worker_id: int = -1,
         shutdown_event: Optional[threading.Event] = None,
+        fatal_broadcast_event: Optional[threading.Event] = None,
     ):
         '''
         Args:
@@ -121,6 +122,7 @@ class PostprocWorker:
         self._record_creator = record_creator
         self._worker_id = worker_id
         self._shutdown_event = shutdown_event
+        self._fatal_broadcast_event = fatal_broadcast_event
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
                                       is_async=True,
                                       is_server=False,
@@ -291,6 +293,9 @@ class PostprocWorker:
         while not self._to_stop.is_set():
             if (self._shutdown_event is not None
                     and self._shutdown_event.is_set()):
+                if (self._fatal_broadcast_event is not None
+                        and self._fatal_broadcast_event.is_set()):
+                    return
                 yield None
                 break
             batch = []
@@ -308,13 +313,16 @@ class PostprocWorker:
             for inp in inputs:
                 if inp is None:
                     self._to_stop.set()
+                    if (self._fatal_broadcast_event is not None
+                            and self._fatal_broadcast_event.is_set()):
+                        return
                     yield None
                     break
                 await handle_single_input(inp, batch)
 
             yield batch
 
-    async def _broadcast_fatal(self, error: BaseException) -> None:
+    async def _broadcast_fatal(self, error: BaseException) -> bool:
         fatal = PostprocWorkerFatal(
             worker_id=self._worker_id,
             error_type=(f"{type(error).__module__}."
@@ -326,9 +334,12 @@ class PostprocWorker:
         )
         # Lane 0 is the launcher and is always present. Other configured
         # frontends may not have attached yet, so every send is bounded.
+        all_lanes_queued = True
         for lane_id, pipe in enumerate(self._push_pipes):
-            await pipe.put_async_bounded(fatal,
-                                         timeout=1.0 if lane_id == 0 else 0.1)
+            queued = await pipe.put_async_bounded(
+                fatal, timeout=1.0 if lane_id == 0 else 0.1)
+            all_lanes_queued = queued and all_lanes_queued
+        return all_lanes_queued
 
     async def _drain_until_shutdown(self) -> None:
         """Keep the feed peer alive until rank 0 stops its response producer."""
@@ -368,9 +379,24 @@ class PostprocWorker:
                 # draining the input peer until rank 0 stops the engine response
                 # producer, otherwise that producer can block forever in send
                 # and prevent the MPI future from completing.
+                all_lanes_queued = False
+                try:
+                    all_lanes_queued = await self._broadcast_fatal(error)
+                except BaseException as broadcast_error:
+                    # A broken result lane must not prevent rank 0 from seeing
+                    # the worker failure or prevent this thread from draining
+                    # the engine response producer.
+                    logger.error(
+                        "Failed to broadcast postprocessing worker fatal "
+                        f"error: {broadcast_error}")
+                if (all_lanes_queued
+                        and self._fatal_broadcast_event is not None):
+                    # Suppress healthy workers' generic terminal markers only
+                    # after every configured result lane has queued the typed
+                    # fatal message.
+                    self._fatal_broadcast_event.set()
                 if failure_event is not None:
                     failure_event.set()
-                await self._broadcast_fatal(error)
                 await self._drain_until_shutdown()
                 raise
 
@@ -388,15 +414,17 @@ class PostprocWorker:
 
 
 @print_traceback_on_error
-def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
-                         feedout_ipc_addrs: List[tuple[str, Optional[bytes]]],
-                         tokenizer_dir: str,
-                         record_creator: Callable,
-                         post_processor_hook: Optional[str] = None,
-                         worker_id: int = -1,
-                         shutdown_event: Optional[threading.Event] = None,
-                         ready_event: Optional[threading.Event] = None,
-                         failure_event: Optional[threading.Event] = None):
+def postproc_worker_main(
+        feedin_ipc_addr: tuple[str, Optional[bytes]],
+        feedout_ipc_addrs: List[tuple[str, Optional[bytes]]],
+        tokenizer_dir: str,
+        record_creator: Callable,
+        post_processor_hook: Optional[str] = None,
+        worker_id: int = -1,
+        shutdown_event: Optional[threading.Event] = None,
+        fatal_broadcast_event: Optional[threading.Event] = None,
+        ready_event: Optional[threading.Event] = None,
+        failure_event: Optional[threading.Event] = None):
     # Pass the hook import path; PostprocWorker builds it once.
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addrs,
@@ -404,7 +432,8 @@ def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
                             record_creator=record_creator,
                             post_processor_hook=post_processor_hook,
                             worker_id=worker_id,
-                            shutdown_event=shutdown_event)
+                            shutdown_event=shutdown_event,
+                            fatal_broadcast_event=fatal_broadcast_event)
     try:
         worker.start(ready_event=ready_event, failure_event=failure_event)
     finally:

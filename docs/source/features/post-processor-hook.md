@@ -8,9 +8,9 @@ lets a deployment rewrite, redact, suppress, or terminate model output — inclu
 spans the chunks of a streamed response — without modifying TensorRT LLM source.
 
 The hook is a plain Python callable class supplied by import path, mirroring `--custom_tokenizer`. It
-is owned by the `LLM` instance (and built once in each post-processing worker process when those are
+is owned by the `LLM` instance (and built once in each post-processing worker thread when those are
 enabled) and invoked once per output, per streaming chunk (plus a final call), so it can hold its own
-per-request state. Independent `LLM` instances in one process each own a separate hook instance.
+per-request state. Independent `LLM` instances in one process each own separate hook instances.
 
 ```{note}
 This feature is a prototype and its interface may change in a future release.
@@ -36,12 +36,13 @@ post_processor_hook: my_pkg.guardrail.MyPostProcessorHook
 The class must be:
 
 - **Importable** — installed (`pip install`) or on `PYTHONPATH` when the server (and its
-  post-processing worker processes, if any) start.
-- **Picklable and no-argument-constructible** — the hook is reconstructed by reference inside each
-  process; `__init__` takes no required arguments and is the one-time setup point.
+  rank-0 executor and post-processing worker threads, if any) start.
+- **No-argument-constructible** — `__init__` takes no required arguments and is the one-time setup
+  point for each hook instance. The hook object itself does not need to be picklable.
 
-The hook works the same with or without the out-of-process post-processing worker pool
-(`--num_postprocess_workers`).
+The hook works with or without parallel post-processing. When `--num_postprocess_workers` is greater
+than zero, it selects that many supervised threads in the rank-0 executor process. It does not create
+an out-of-process isolation boundary.
 
 ## The hook interface
 
@@ -142,12 +143,14 @@ class SuppressHook:
 
 ## Per-request state
 
-The hook instance is owned by the `LLM` (built once in each post-processing worker process when the
-pool is enabled) and shared across all requests it handles, so any per-request state must be keyed by
-`chunk.request_id` and released when `chunk.is_final` is seen (or after a `terminate`). State is not
-shared across processes or across separate `LLM` instances; when the post-processing worker pool is
-enabled, all chunks of a single request are still routed to the same worker, so per-request state
-remains consistent for that request.
+The hook instance is owned by the `LLM` (each rank-0 post-processing worker thread constructs its own
+tokenizer and hook when parallel post-processing is enabled) and shared across all requests that
+worker handles. Any per-request state must be keyed by `chunk.request_id` and released when
+`chunk.is_final` is seen (or after a `terminate`). Hook instance attributes are not shared between
+workers or separate `LLM` instances. The worker threads do share rank 0's process-global state,
+including module globals, class variables, environment changes, and native libraries; access to
+such state must be thread-safe, and hooks must not rely on process isolation. All chunks of a single
+request are routed to the same worker, keeping its instance-local per-request state consistent.
 
 Engine-level batching is transparent to the hook: even when requests are batched together in the
 engine, the hook is invoked **once per request** (per output, per chunk) — there is no batched-call
@@ -178,9 +181,15 @@ form — so keying state on `chunk.request_id` is sufficient to keep concurrent 
 - **Reasoning / tool parsing**: the hook runs before the reasoning and tool-call parsers. A hook that
   rewrites or suppresses text may desync those parsers; prefer `terminate`, or apply such hooks to
   plain-text requests.
-- **Hook errors fail closed**: if the hook raises, the request fails with an error rather than serving
-  the un-vetted chunk (the server and other requests stay alive). A returned verdict with an unknown
-  action is rejected the same way.
+- **Ordinary hook errors fail closed per request**: if the hook raises a Python `Exception`, the
+  request fails with an error rather than serving the un-vetted chunk (the server and other requests
+  stay alive). A returned verdict with an unknown action is rejected the same way. `BaseException`
+  subclasses and native failures are engine-fatal instead.
+- **Native failure isolation**: parallel post-processing workers are threads in rank 0, not child
+  processes. CPU-bound pure-Python hooks share the Python GIL. This design avoids forking after
+  MPI/CUDA initialization, but a native crash (for example, a segmentation fault in hook or
+  tokenizer native code) can terminate rank 0. Pending requests are then failed by the executor
+  proxy instead of waiting indefinitely.
 - **`n` > 1 / beam search**: `emit` and `suppress` act per output sequence, but `terminate` cancels the
   **whole** request (all sequences), because the engine request is the unit of cancellation — a
   `terminate` on one candidate ends the others too. Hooks needing per-sequence state should key on

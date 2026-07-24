@@ -566,8 +566,8 @@ class GenerationExecutor(ABC):
 
         if postproc_worker_config.enabled:
             logger_debug(
-                f"Using {postproc_worker_config.num_postprocess_workers} postprocess parallel processes.\n",
-                "green")
+                f"Using {postproc_worker_config.num_postprocess_workers} "
+                "postprocess parallel threads.\n", "green")
 
         # Multi-frontend serving: attach to an already-running executor
         # instead of launching one (set by trtllm-serve for attached

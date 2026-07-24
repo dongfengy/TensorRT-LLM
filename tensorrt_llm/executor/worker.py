@@ -308,8 +308,8 @@ def worker_main(
         ) if worker_queues.resource_governor_queue_addr else None
 
         if postproc_worker_config.enabled:
-            # IPC queues for sending inputs to the postprocess parallel
-            # processes, each one is a PAIR zmq socket
+            # IPC queues for sending inputs to the parallel postprocessing
+            # worker threads, each one is a PAIR zmq socket
             result_queues = [
                 FusedIpcQueue(is_server=True,
                               fuse_message=False,
@@ -355,6 +355,7 @@ def worker_main(
     postprocess_worker_ready_events: List[threading.Event] = []
     postprocess_worker_failure_events: List[threading.Event] = []
     postprocess_worker_shutdown_events: List[threading.Event] = []
+    postprocess_worker_fatal_broadcast_event = threading.Event()
     postproc_shutdown_requested = False
 
     def start_postproc_workers() -> None:
@@ -388,6 +389,7 @@ def worker_main(
                 postproc_worker_config.post_processor_hook,
                 worker_id=i,
                 shutdown_event=shutdown_event,
+                fatal_broadcast_event=postprocess_worker_fatal_broadcast_event,
                 ready_event=ready_event,
                 failure_event=failure_event,
             )

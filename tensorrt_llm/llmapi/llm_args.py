@@ -4138,8 +4138,8 @@ class BaseLlmArgs(StrictBaseModel):
         description=
         "Python import path of a user post-processing hook applied after "
         "detokenization and before the per-endpoint response formatter (e.g. "
-        "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable and "
-        "picklable, take no constructor arguments, and be callable as "
+        "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable, "
+        "take no constructor arguments, and be callable as "
         "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
         "It runs once per output, per streaming chunk, and may rewrite, "
         "suppress, or terminate the output; it owns its own per-request state.",
@@ -4329,7 +4329,8 @@ class BaseLlmArgs(StrictBaseModel):
     num_postprocess_workers: int = Field(
         default=0,
         description=
-        "The number of processes used for postprocessing the generated tokens, including detokenization.",
+        "The number of supervised rank-0 threads used for postprocessing the "
+        "generated tokens, including detokenization.",
         status="prototype")
 
     postprocess_tokenizer_dir: Optional[str] = Field(
