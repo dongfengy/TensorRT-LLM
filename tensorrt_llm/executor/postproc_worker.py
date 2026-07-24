@@ -1,9 +1,12 @@
 import asyncio
+import json
+import os
+import sys
 import traceback
 from collections import deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
-                    Optional, Union)
+from typing import (TYPE_CHECKING, Any, BinaryIO, Callable, Dict, List,
+                    NamedTuple, Optional, Union)
 
 import zmq
 
@@ -26,6 +29,78 @@ __all__ = [
     "PostprocWorker",
     "PostprocWorkerConfig",
 ]
+
+POSTPROC_WORKER_READY_FD_ENV = "TLLM_POSTPROC_WORKER_READY_FD"
+POSTPROC_WORKER_SUBPROCESS_COMMAND = f"""
+import os
+import sys
+
+_ready_fd = int(os.environ.pop({POSTPROC_WORKER_READY_FD_ENV!r}))
+_keep_fds = {{0, 1, 2, _ready_fd}}
+for _fd_root in ("/proc/self/fd", "/dev/fd"):
+    try:
+        _open_fds = os.listdir(_fd_root)
+    except OSError:
+        continue
+    for _fd_name in _open_fds:
+        try:
+            _fd = int(_fd_name)
+            if _fd not in _keep_fds:
+                os.close(_fd)
+        except (OSError, ValueError):
+            pass
+    break
+else:
+    _open_max = int(os.sysconf("SC_OPEN_MAX"))
+    os.closerange(3, _ready_fd)
+    os.closerange(_ready_fd + 1, _open_max)
+
+import json
+sys.path[:] = json.loads(sys.argv[1])
+del sys.argv[1:]
+from tensorrt_llm.executor.postproc_worker import postproc_worker_subprocess_main
+postproc_worker_subprocess_main(_ready_fd)
+"""
+
+
+def _encode_ipc_addr(
+        address: tuple[str, Optional[bytes]]) -> dict[str, Optional[str]]:
+    endpoint, hmac_key = address
+    return {
+        "endpoint": endpoint,
+        "hmac_key": hmac_key.hex() if hmac_key is not None else None,
+    }
+
+
+def _decode_ipc_addr(
+        encoded: dict[str, Optional[str]]) -> tuple[str, Optional[bytes]]:
+    endpoint = encoded["endpoint"]
+    if endpoint is None:
+        raise ValueError("IPC endpoint must not be None")
+    hmac_key = encoded["hmac_key"]
+    return endpoint, (bytes.fromhex(hmac_key) if hmac_key is not None else None)
+
+
+def encode_postproc_worker_spec(
+        feedin_ipc_addr: tuple[str, Optional[bytes]],
+        feedout_ipc_addrs: List[tuple[str, Optional[bytes]]],
+        tokenizer_dir: Optional[str],
+        post_processor_hook: Optional[str] = None) -> bytes:
+    """Serialize the private launch config for a clean-exec worker.
+
+    The ZeroMQ HMAC keys travel over the child's private stdin pipe rather
+    than appearing in argv or the environment.
+    """
+    return json.dumps({
+        "feedin_ipc_addr":
+        _encode_ipc_addr(feedin_ipc_addr),
+        "feedout_ipc_addrs":
+        [_encode_ipc_addr(address) for address in feedout_ipc_addrs],
+        "tokenizer_dir":
+        str(tokenizer_dir) if tokenizer_dir is not None else None,
+        "post_processor_hook":
+        post_processor_hook,
+    }).encode()
 
 
 @dataclass(kw_only=True)
@@ -287,10 +362,19 @@ class PostprocWorker:
 
             yield batch
 
-    def start(self):
+    def start(self, ready_pipe: Optional[BinaryIO] = None):
         ''' Start the workflow in the current thread. '''
 
         async def main():
+            # Connect every socket before reporting READY. The launcher must
+            # not publish engine readiness while a postprocessing sidecar can
+            # still fail during tokenizer, hook, or IPC initialization.
+            self._pull_pipe.setup_lazily()
+            for pipe in self._push_pipes:
+                pipe.setup_lazily()
+            if ready_pipe is not None:
+                ready_pipe.write(b"R")
+                ready_pipe.close()
             await asyncio.gather(self._batched_put())
 
         try:
@@ -313,3 +397,24 @@ def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
                             record_creator=record_creator,
                             post_processor_hook=post_processor_hook)
     worker.start()
+
+
+def postproc_worker_subprocess_main(ready_fd: int) -> None:
+    """Run one postprocessor in a fresh interpreter launched with clean env."""
+    ready_pipe = os.fdopen(ready_fd, "wb", buffering=0)
+    try:
+        spec = json.load(sys.stdin)
+        worker = PostprocWorker(
+            _decode_ipc_addr(spec["feedin_ipc_addr"]),
+            [
+                _decode_ipc_addr(address)
+                for address in spec["feedout_ipc_addrs"]
+            ],
+            tokenizer_dir=spec["tokenizer_dir"],
+            record_creator=PostprocWorker.default_record_creator,
+            post_processor_hook=spec["post_processor_hook"],
+        )
+        worker.start(ready_pipe=ready_pipe)
+    finally:
+        # close() is idempotent if start() already sent READY and closed it.
+        ready_pipe.close()

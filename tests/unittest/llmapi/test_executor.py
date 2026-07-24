@@ -1,5 +1,8 @@
 import asyncio
 import datetime
+import json
+import os
+import signal
 import tempfile
 import threading
 import time
@@ -11,6 +14,8 @@ import pytest
 import torch
 import zmq
 
+import tensorrt_llm.executor.postproc_worker as postproc_worker_module
+import tensorrt_llm.executor.worker as worker_module
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
@@ -279,6 +284,209 @@ def test_handle_response_postproc_nonstreaming_propagates_metadata():
     assert result._done
     assert result._outputs[0].finish_reason == "stop"
     assert len(result._outputs[0].token_ids) == 5
+
+
+class _PostprocProcessStub:
+
+    def __init__(self, pid=123, returncode=None, wait_results=()):
+        self.pid = pid
+        self._returncode = returncode
+        self._wait_results = list(wait_results)
+        self.signals = []
+
+    @property
+    def returncode(self):
+        return self.poll()
+
+    def poll(self):
+        return self._returncode
+
+    def wait(self, timeout=None):
+        del timeout
+        result = self._wait_results.pop(0)
+        if result == "timeout":
+            raise TimeoutError
+        self._returncode = result
+        return result
+
+    def signal_process_group(self, sig):
+        self.signals.append(sig)
+
+
+def test_postproc_worker_spec_round_trips_hmac_keys():
+    payload = postproc_worker_module.encode_postproc_worker_spec(
+        ("ipc://input", b"\x00\xff"),
+        [("ipc://output-0", None), ("ipc://output-1", b"\x01\x02")],
+        "/tokenizer",
+        "hooks.make",
+    )
+    spec = json.loads(payload)
+
+    assert spec["feedin_ipc_addr"]["hmac_key"] == "00ff"
+    assert spec["feedout_ipc_addrs"][0]["hmac_key"] is None
+    assert postproc_worker_module._decode_ipc_addr(
+        spec["feedin_ipc_addr"]) == ("ipc://input", b"\x00\xff")
+    assert postproc_worker_module._decode_ipc_addr(
+        spec["feedout_ipc_addrs"][0]) == ("ipc://output-0", None)
+    assert postproc_worker_module._decode_ipc_addr(
+        spec["feedout_ipc_addrs"][1]) == ("ipc://output-1", b"\x01\x02")
+
+
+def test_spawn_postproc_worker_uses_clean_exec_contract(monkeypatch):
+    opened_fds = []
+    spawn_call = {}
+    writes = []
+
+    def open_pipe():
+        pipe_fds = os.pipe()
+        opened_fds.extend(pipe_fds)
+        return pipe_fds
+
+    def posix_spawn(executable, argv, env, **kwargs):
+        spawn_call.update(executable=executable, argv=argv, env=env, **kwargs)
+        return 43210
+
+    monkeypatch.setattr(worker_module, "_open_cloexec_pipe", open_pipe)
+    monkeypatch.setattr(
+        worker_module, "split_mpi_env", lambda: ({
+            "PATH": "/clean",
+            "SAFE": "1"
+        }, {
+            "OMPI_COMM_WORLD_RANK": "63"
+        }))
+    monkeypatch.setattr(worker_module.os, "posix_spawn", posix_spawn)
+    monkeypatch.setattr(worker_module, "_write_all",
+                        lambda fd, payload: writes.append((fd, payload)))
+
+    payload = b'{"hmac_key":"private-0102"}'
+    processes = []
+    ready_fd = worker_module._spawn_postproc_worker(payload, processes)
+    spec_read_fd, spec_write_fd, _, ready_write_fd = opened_fds
+    child_ready_fd = int(
+        spawn_call["env"][postproc_worker_module.POSTPROC_WORKER_READY_FD_ENV])
+    try:
+        executable = os.path.abspath(worker_module.sys.executable)
+        assert spawn_call["executable"] == executable
+        assert spawn_call["argv"][:5] == [
+            executable,
+            "-I",
+            "-S",
+            "-c",
+            worker_module.POSTPROC_WORKER_SUBPROCESS_COMMAND,
+        ]
+        assert all(
+            os.path.isabs(path) for path in json.loads(spawn_call["argv"][5]))
+        assert spawn_call["env"] == {
+            "PATH":
+            "/clean",
+            "SAFE":
+            "1",
+            "TLLM_DISABLE_MPI":
+            "1",
+            postproc_worker_module.POSTPROC_WORKER_READY_FD_ENV:
+            str(child_ready_fd),
+        }
+        assert "private-0102" not in json.dumps(spawn_call["argv"])
+        assert "private-0102" not in json.dumps(spawn_call["env"])
+        assert spawn_call["file_actions"] == [
+            (os.POSIX_SPAWN_DUP2, spec_read_fd, 0),
+            (os.POSIX_SPAWN_DUP2, ready_write_fd, child_ready_fd),
+            (os.POSIX_SPAWN_CLOSE, spec_read_fd),
+            (os.POSIX_SPAWN_CLOSE, spec_write_fd),
+            (os.POSIX_SPAWN_CLOSE, ready_fd),
+            (os.POSIX_SPAWN_CLOSE, ready_write_fd),
+        ]
+        assert spawn_call["setpgroup"] == 0
+        assert spawn_call["setsigmask"] == ()
+        assert spawn_call["setsigdef"] == worker_module._SPAWN_DEFAULT_SIGNALS
+        assert writes == [(spec_write_fd, payload)]
+        assert [process.pid for process in processes] == [43210]
+        os.fstat(ready_fd)
+        for fd in (spec_read_fd, spec_write_fd, ready_write_fd, child_ready_fd):
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        worker_module._close_fd(ready_fd)
+
+
+@pytest.mark.parametrize(
+    ("ready_payload", "returncode", "timeout", "error"),
+    [
+        (b"R", None, None, None),
+        (b"", None, None, "before signaling READY"),
+        (b"R", 17, None, "code 17 immediately after READY"),
+        (None, None, "0.01", "not ready within"),
+    ],
+)
+def test_wait_postproc_workers_ready_states(monkeypatch, ready_payload,
+                                            returncode, timeout, error):
+    ready_read_fd, ready_write_fd = os.pipe()
+    process = _PostprocProcessStub(returncode=returncode)
+    try:
+        if ready_payload is not None:
+            if ready_payload:
+                os.write(ready_write_fd, ready_payload)
+            os.close(ready_write_fd)
+            ready_write_fd = -1
+        monkeypatch.setenv("TLLM_POSTPROC_WORKER_READY_TIMEOUT", timeout or "1")
+        if error is None:
+            worker_module._wait_postproc_workers_ready([process],
+                                                       [ready_read_fd])
+        else:
+            with pytest.raises(RuntimeError, match=error):
+                worker_module._wait_postproc_workers_ready([process],
+                                                           [ready_read_fd])
+    finally:
+        worker_module._close_fd(ready_read_fd)
+        worker_module._close_fd(ready_write_fd)
+
+
+def test_start_postproc_workers_preserves_partial_process_for_cleanup(
+        monkeypatch):
+    ready_read_fd, ready_write_fd = os.pipe()
+    worker_module._close_fd(ready_write_fd)
+    first_process = _PostprocProcessStub(pid=321)
+
+    def spawn(spec, processes):
+        del spec
+        if not processes:
+            processes.append(first_process)
+            return ready_read_fd
+        raise RuntimeError("second worker failed")
+
+    monkeypatch.setattr(worker_module, "_spawn_postproc_worker", spawn)
+    config = postproc_worker_module.PostprocWorkerConfig(
+        num_postprocess_workers=2, postprocess_tokenizer_dir="/tokenizer")
+    result_queues = [
+        type("Queue", (), {"address": ("ipc://input-0", None)})(),
+        type("Queue", (), {"address": ("ipc://input-1", None)})(),
+    ]
+    processes = []
+
+    with pytest.raises(RuntimeError, match="second worker failed"):
+        worker_module._start_postproc_workers(
+            result_queues,
+            [("ipc://output", None)],
+            config,
+            processes,
+        )
+
+    assert processes == [first_process]
+    with pytest.raises(OSError):
+        os.fstat(ready_read_fd)
+
+
+def test_reap_postproc_workers_uses_graceful_then_bounded_escalation():
+    graceful = _PostprocProcessStub(pid=1, wait_results=[0])
+    stubborn = _PostprocProcessStub(
+        pid=2, wait_results=["timeout", "timeout", -signal.SIGKILL])
+
+    worker_module._reap_postproc_workers([graceful, stubborn])
+
+    assert graceful.returncode == 0
+    assert graceful.signals == []
+    assert stubborn.returncode == -signal.SIGKILL
+    assert stubborn.signals == [signal.SIGTERM, signal.SIGKILL]
 
 
 def _ZeroMqQueue_sync_sync_task(addr: str):
