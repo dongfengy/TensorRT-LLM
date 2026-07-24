@@ -3,9 +3,9 @@ import os
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import zmq
 
@@ -158,6 +158,61 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                 self.engine.wait_shutdown()
 
 
+def _raise_if_postproc_worker_failed(
+    futures: Sequence[Future[None]],
+    failure_events: Sequence[threading.Event] = ()
+) -> None:
+    """Raise when a postprocessing worker exits before engine shutdown."""
+    for worker_id, failure_event in enumerate(failure_events):
+        if failure_event.is_set():
+            raise RuntimeError(
+                f"Postprocessing worker {worker_id} reported a fatal error")
+
+    for worker_id, future in enumerate(futures):
+        if not future.done():
+            continue
+        if future.cancelled():
+            raise RuntimeError(
+                f"Postprocessing worker {worker_id} was cancelled unexpectedly")
+        error = future.exception()
+        if error is not None:
+            raise RuntimeError(
+                f"Postprocessing worker {worker_id} failed") from error
+        raise RuntimeError(
+            f"Postprocessing worker {worker_id} exited unexpectedly")
+
+
+def _wait_for_postproc_workers(
+        ready_events: Sequence[threading.Event],
+        futures: Sequence[Future[None]],
+        failure_events: Sequence[threading.Event]) -> None:
+    """Wait until every postprocessing worker has initialized successfully."""
+    for ready_event in ready_events:
+        while not ready_event.wait(timeout=0.1):
+            _raise_if_postproc_worker_failed(futures, failure_events)
+    _raise_if_postproc_worker_failed(futures, failure_events)
+
+
+def _notify_postproc_workers_to_quit(
+        result_queues: Sequence[FusedIpcQueue], futures: Sequence[Future[None]],
+        shutdown_events: Sequence[threading.Event]) -> None:
+    """Send shutdown only to workers whose PAIR peer is still alive."""
+    for worker_id, queue in enumerate(result_queues):
+        if worker_id < len(shutdown_events):
+            # Guaranteed fallback for a worker whose PAIR peer cannot receive
+            # the fast-path sentinel.
+            shutdown_events[worker_id].set()
+
+        # A failed worker has already closed its PAIR peer. Sending to that
+        # orphaned queue can block indefinitely because ZeroMQ uses infinite
+        # linger by default.
+        if worker_id >= len(futures) or futures[worker_id].done():
+            continue
+        if not queue.put_bounded(None, timeout=1.0):
+            logger.warning(
+                f"Failed to send shutdown to postprocessing worker {worker_id}")
+
+
 @print_traceback_on_error
 def worker_main(
     engine: Path,
@@ -280,6 +335,7 @@ def worker_main(
                                          name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
+        nonlocal postproc_shutdown_requested
         # Signal the dispatcher thread in every frontend proxy to quit
         if result_queue is not None:
             result_queue.put(None)
@@ -288,32 +344,61 @@ def worker_main(
                 q.put(None)
         else:
             assert result_queues is not None
-            for q in result_queues:
-                q.put(None)
+            if not postproc_shutdown_requested:
+                postproc_shutdown_requested = True
+                _notify_postproc_workers_to_quit(
+                    result_queues, postprocess_worker_futures,
+                    postprocess_worker_shutdown_events)
 
-    postprocess_worker_futures = []
-    if is_leader and postproc_worker_config.enabled:
-        logger_debug(f"initiate postprocess workers...", "yellow")
+    postproc_worker_pool: Optional[ThreadPoolExecutor] = None
+    postprocess_worker_futures: List[Future[None]] = []
+    postprocess_worker_ready_events: List[threading.Event] = []
+    postprocess_worker_failure_events: List[threading.Event] = []
+    postprocess_worker_shutdown_events: List[threading.Event] = []
+    postproc_shutdown_requested = False
 
-        # Each postproc worker pushes to every frontend result lane (a
-        # single lane in single-frontend mode).
+    def start_postproc_workers() -> None:
+        nonlocal postproc_worker_pool
+        logger_debug("initiate postprocess workers...", "yellow")
+
+        # Forking a process after MPI, CUDA, NCCL, and allocator state have
+        # initialized is unsafe. In particular, a forked postprocessing child
+        # can crash in malloc/calloc while the rank-0 worker remains alive and
+        # eventually blocks forever feeding its orphaned PAIR socket. Keep the
+        # workers in supervised threads in rank 0 instead. Native failures now
+        # terminate rank 0 and are surfaced by the existing MPI-future monitor.
         proxy_result_addrs = (multi_frontend_addrs
                               if multi_frontend_addrs is not None else
                               [worker_queues.result_queue_addr])
 
         assert result_queues is not None
-        postproc_worker_pool = ProcessPoolExecutor(
-            max_workers=postproc_worker_config.num_postprocess_workers)
+        postproc_worker_pool = ThreadPoolExecutor(
+            max_workers=postproc_worker_config.num_postprocess_workers,
+            thread_name_prefix="postprocess")
         for i in range(postproc_worker_config.num_postprocess_workers):
-            fut = postproc_worker_pool.submit(
+            ready_event = threading.Event()
+            failure_event = threading.Event()
+            shutdown_event = threading.Event()
+            future = postproc_worker_pool.submit(
                 postproc_worker_main,
                 result_queues[i].address,
                 proxy_result_addrs,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
                 postproc_worker_config.post_processor_hook,
+                worker_id=i,
+                shutdown_event=shutdown_event,
+                ready_event=ready_event,
+                failure_event=failure_event,
             )
-            postprocess_worker_futures.append(fut)
+            postprocess_worker_ready_events.append(ready_event)
+            postprocess_worker_failure_events.append(failure_event)
+            postprocess_worker_shutdown_events.append(shutdown_event)
+            postprocess_worker_futures.append(future)
+
+        _wait_for_postproc_workers(postprocess_worker_ready_events,
+                                   postprocess_worker_futures,
+                                   postprocess_worker_failure_events)
 
     # Error handling in the Worker/MPI process
     #   1. During Executor initialization, the errors will be captured and
@@ -358,54 +443,106 @@ def worker_main(
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
         gc.disable()
 
-    with worker:
-        try:
-            worker.block_subordinates()
+    try:
+        with worker:
+            try:
+                worker.block_subordinates()
 
-            if is_leader:
-                if postproc_worker_config.enabled:
-                    worker.set_postproc_queues(result_queues)
-                elif frontend_result_queues is not None:
-                    worker.set_frontend_result_queues(frontend_result_queues)
-                else:
-                    worker.set_result_queue(result_queue)
-
-                # Send ready signal with confirmation
-                ready_msg = (ready_signal, None, worker_process_identities)
-                if not worker_init_status_queue.notify_with_retry(ready_msg):
-                    logger.warning(
-                        "Failed to deliver ready signal to proxy, continuing anyway"
-                    )
-                if resource_governor_queue is not None:
-                    # Swap rank 0 to the proxy IPC queue after construction.
-                    # The resource-governor flag is already enabled on all
-                    # ranks.
-                    worker.engine.set_resource_governor_queue(
-                        resource_governor_queue)
-
-                while (req := request_queue.get()) is not None:
-                    if isinstance(req, CancellingRequest):
-                        worker.abort_request(req.id)
-                    elif isinstance(req, GenerationRequest):
+                if is_leader:
+                    if postproc_worker_config.enabled:
+                        worker.set_postproc_queues(result_queues)
                         try:
-                            worker.submit(req)
-                        except RequestError as e:
-                            logger.error(f"submit request failed: {e}")
-                            logger.error(traceback.format_exc())
-                            worker._await_response_helper.temp_error_responses.put(
-                                ErrorResponse(req.id, e, req.id))
+                            start_postproc_workers()
+                        except Exception as e:
+                            error_msg = (e, traceback.format_exc())
+                            if not worker_init_status_queue.notify_with_retry(
+                                    error_msg):
+                                logger.error(
+                                    "Failed to deliver postprocessing worker "
+                                    "initialization error to proxy")
+                            raise
+                    elif frontend_result_queues is not None:
+                        worker.set_frontend_result_queues(
+                            frontend_result_queues)
                     else:
-                        raise ValueError(f"Unknown request type: {type(req)}")
+                        worker.set_result_queue(result_queue)
 
+                    # Send ready signal with confirmation. For postprocessing
+                    # parallelism this happens only after every worker has
+                    # initialized its tokenizer, hook, and IPC queues.
+                    if postproc_worker_config.enabled:
+                        _raise_if_postproc_worker_failed(
+                            postprocess_worker_futures,
+                            postprocess_worker_failure_events)
+                    ready_msg = (ready_signal, None, worker_process_identities)
+                    if not worker_init_status_queue.notify_with_retry(
+                            ready_msg):
+                        logger.warning(
+                            "Failed to deliver ready signal to proxy, continuing anyway"
+                        )
+                    if resource_governor_queue is not None:
+                        # Swap rank 0 to the proxy IPC queue after construction.
+                        # The resource-governor flag is already enabled on all
+                        # ranks.
+                        worker.engine.set_resource_governor_queue(
+                            resource_governor_queue)
+
+                    while True:
+                        if postproc_worker_config.enabled:
+                            _raise_if_postproc_worker_failed(
+                                postprocess_worker_futures,
+                                postprocess_worker_failure_events)
+                            # Periodically re-check worker futures even when no
+                            # new requests arrive. This turns an infrastructure
+                            # failure into rank-0 failure instead of leaving
+                            # clients blocked on a response that cannot arrive.
+                            if not request_queue.poll(1):
+                                continue
+
+                        req = request_queue.get()
+                        if req is None:
+                            break
+                        if isinstance(req, CancellingRequest):
+                            worker.abort_request(req.id)
+                        elif isinstance(req, GenerationRequest):
+                            try:
+                                worker.submit(req)
+                            except RequestError as e:
+                                logger.error(f"submit request failed: {e}")
+                                logger.error(traceback.format_exc())
+                                worker._await_response_helper.temp_error_responses.put(
+                                    ErrorResponse(req.id, e, req.id))
+                        else:
+                            raise ValueError(
+                                f"Unknown request type: {type(req)}")
+
+            except GenerationExecutorWorker.WorkerExit as e:
+                # This will capture by the with-statement and exit normally.
+                raise e
+
+            except Exception as e:  # other critical errors
+                logger.error(traceback.format_exc())
+                # This will be captured by mpi4py and handled by
+                # future.done_callback in the proxy.
+                raise e
+    finally:
+        if is_leader:
+            # The worker context has stopped and joined the engine response
+            # producer. Only now may postprocessing workers receive their feed
+            # sentinels and proxy dispatchers receive their terminal messages.
+            try:
                 notify_proxy_threads_to_quit()
-
-        except GenerationExecutorWorker.WorkerExit as e:
-            # This will capture by the with-statement and exit normally.
-            raise e
-
-        except Exception as e:  # other critical errors
-            if is_leader:
-                notify_proxy_threads_to_quit()
-            logger.error(traceback.format_exc())
-            # This will be captured by mpi4py and handled by future.done_callback
-            raise e
+            finally:
+                if postproc_worker_pool is not None:
+                    try:
+                        postproc_worker_pool.shutdown(wait=True,
+                                                      cancel_futures=True)
+                    finally:
+                        assert result_queues is not None
+                        for queue in result_queues:
+                            try:
+                                queue.close(linger_ms=1000)
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to close postprocessing feed "
+                                    f"queue: {e}")

@@ -38,7 +38,8 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
+                              PostprocWorkerFatal)
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
@@ -529,10 +530,33 @@ class GenerationExecutorProxy(GenerationExecutor):
         # send back a finished result.
         self.request_queue.put(CancellingRequest(request_id))
 
+    def _handle_postproc_worker_fatal(self, fatal: PostprocWorkerFatal) -> None:
+        error = RuntimeError(
+            f"Postprocessing worker {fatal.worker_id} failed with "
+            f"{fatal.error_type}: {fatal.error_message}\n{fatal.traceback}")
+        logger.error(str(error))
+        self._set_fatal_error(error)
+        if not self.doing_shutdown:
+            self.pre_shutdown()
+
+    def _handle_unexpected_result_lane_close(self) -> None:
+        error = RuntimeError(
+            "Postprocessing result lane closed before proxy shutdown")
+        logger.error(str(error))
+        self._set_fatal_error(error)
+        if not self.doing_shutdown:
+            self.pre_shutdown()
+
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        if (res := self.result_queue.get()) is None:
+        res = self.result_queue.get()
+        if isinstance(res, PostprocWorkerFatal):
+            self._handle_postproc_worker_fatal(res)
+            return False
+        if res is None:
+            if not self.doing_shutdown:
+                self._handle_unexpected_result_lane_close()
             return False  # shutdown the thread
 
         async_queues = []
@@ -571,7 +595,12 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         for i in res:
             global_tracer().log_instant("IPC.get")
+            if isinstance(i, PostprocWorkerFatal):
+                self._handle_postproc_worker_fatal(i)
+                return False
             if i is None:
+                if not self.doing_shutdown:
+                    self._handle_unexpected_result_lane_close()
                 return False
             process_res(i)
 

@@ -3,7 +3,7 @@ import datetime
 import tempfile
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty
 
@@ -392,7 +392,10 @@ def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
         push_pipe_addrs=[push_pipe_addr],
         tokenizer_dir=tokenizer_dir,
         record_creator=ResponsePostprocessWorker_record_creator)
-    worker.start()
+    try:
+        worker.start()
+    finally:
+        worker.close()
 
 
 def test_ResponsePostprocessWorker():
@@ -400,7 +403,7 @@ def test_ResponsePostprocessWorker():
     input_pipe = ZeroMqQueue(is_server=True)
     out_pipe = ZeroMqQueue(is_server=True, socket_type=zmq.PULL)
 
-    pool = ProcessPoolExecutor(max_workers=1)
+    pool = ThreadPoolExecutor(max_workers=1)
     print("submit task")
     fut = pool.submit(
         ResponsePostprocessWorker_worker_task, input_pipe.address,
@@ -496,7 +499,7 @@ def test_PostprocWorker_disaggregated_params():
     input_pipe = ZeroMqQueue(is_server=True)
     out_pipe = ZeroMqQueue(is_server=True, socket_type=zmq.PULL)
 
-    pool = ProcessPoolExecutor(max_workers=1)
+    pool = ThreadPoolExecutor(max_workers=1)
     fut = pool.submit(
         ResponsePostprocessWorker_worker_task, input_pipe.address,
         out_pipe.address,

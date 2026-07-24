@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import traceback
 from collections import deque
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PostprocWorker",
     "PostprocWorkerConfig",
+    "PostprocWorkerFatal",
 ]
 
 
@@ -55,6 +57,15 @@ class PostprocWorkerConfig:
     @property
     def enabled(self) -> bool:
         return self.num_postprocess_workers > 0
+
+
+class PostprocWorkerFatal(NamedTuple):
+    """Picklable control message for an unexpected worker failure."""
+
+    worker_id: int
+    error_type: str
+    error_message: str
+    traceback: str
 
 
 class PostprocWorker:
@@ -91,6 +102,8 @@ class PostprocWorker:
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
         post_processor_hook: Optional[str] = None,
+        worker_id: int = -1,
+        shutdown_event: Optional[threading.Event] = None,
     ):
         '''
         Args:
@@ -106,6 +119,8 @@ class PostprocWorker:
 
         self._records: Dict[int, GenerationResult] = {}
         self._record_creator = record_creator
+        self._worker_id = worker_id
+        self._shutdown_event = shutdown_event
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
                                       is_async=True,
                                       is_server=False,
@@ -199,8 +214,12 @@ class PostprocWorker:
             if batch is None:
                 # notify the dispatch_result coroutine in every frontend to
                 # quit
-                for pipe in self._push_pipes:
-                    await pipe.put_async(None)
+                # Lane 0 is the launcher and remains bound while its dispatcher
+                # joins, so deliver its terminal marker reliably. Optional
+                # attached lanes must not make shutdown unbounded.
+                await self._push_pipes[0].put_async(None)
+                for pipe in self._push_pipes[1:]:
+                    await pipe.put_async_bounded(None, timeout=0.1)
                 break
             assert isinstance(batch, list)
             if len(self._push_pipes) == 1:
@@ -270,10 +289,18 @@ class PostprocWorker:
                 self._records.pop(client_id, None)
 
         while not self._to_stop.is_set():
+            if (self._shutdown_event is not None
+                    and self._shutdown_event.is_set()):
+                yield None
+                break
             batch = []
-            inputs: Optional[List[PostprocWorker.Input]
-                             | PostprocWorker.
-                             Input] = await self._pull_pipe.get_async()
+            try:
+                inputs: Optional[Union[
+                    List[PostprocWorker.Input],
+                    PostprocWorker.Input,
+                ]] = await self._pull_pipe.get_async_noblock(timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
 
             if not isinstance(inputs, list):
                 inputs = [inputs]
@@ -287,17 +314,77 @@ class PostprocWorker:
 
             yield batch
 
-    def start(self):
+    async def _broadcast_fatal(self, error: BaseException) -> None:
+        fatal = PostprocWorkerFatal(
+            worker_id=self._worker_id,
+            error_type=(f"{type(error).__module__}."
+                        f"{type(error).__qualname__}"),
+            error_message=str(error),
+            traceback="".join(
+                traceback.format_exception(type(error), error,
+                                           error.__traceback__)),
+        )
+        # Lane 0 is the launcher and is always present. Other configured
+        # frontends may not have attached yet, so every send is bounded.
+        for lane_id, pipe in enumerate(self._push_pipes):
+            await pipe.put_async_bounded(fatal,
+                                         timeout=1.0 if lane_id == 0 else 0.1)
+
+    async def _drain_until_shutdown(self) -> None:
+        """Keep the feed peer alive until rank 0 stops its response producer."""
+        while True:
+            if (self._shutdown_event is not None
+                    and self._shutdown_event.is_set()):
+                return
+            try:
+                inputs = await self._pull_pipe.get_async_noblock(timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            except BaseException:
+                return
+            if inputs is None:
+                return
+            if isinstance(inputs, list) and any(inp is None for inp in inputs):
+                return
+
+    def start(self,
+              ready_event: Optional[threading.Event] = None,
+              failure_event: Optional[threading.Event] = None):
         ''' Start the workflow in the current thread. '''
 
         async def main():
-            await asyncio.gather(self._batched_put())
+            # Establish every socket from its owning thread and active asyncio
+            # loop before allowing the rank-0 worker to report READY.
+            self._pull_pipe.setup_lazily()
+            for pipe in self._push_pipes:
+                pipe.setup_lazily()
+            if ready_event is not None:
+                ready_event.set()
+
+            try:
+                await asyncio.gather(self._batched_put())
+            except BaseException as error:
+                # Wake every frontend before this thread can disappear. Keep
+                # draining the input peer until rank 0 stops the engine response
+                # producer, otherwise that producer can block forever in send
+                # and prevent the MPI future from completing.
+                if failure_event is not None:
+                    failure_event.set()
+                await self._broadcast_fatal(error)
+                await self._drain_until_shutdown()
+                raise
 
         try:
             asyncio.run(main())
-        except Exception as e:
+        except BaseException:
             print(traceback.format_exc())
-            raise e
+            raise
+
+    def close(self):
+        # ZeroMQ defaults to infinite linger. A configured frontend may be
+        # absent during failure cleanup, so no socket close may wait forever.
+        for pipe in [*self._push_pipes, self._pull_pipe]:
+            pipe.close(linger_ms=1000)
 
 
 @print_traceback_on_error
@@ -305,11 +392,20 @@ def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
                          feedout_ipc_addrs: List[tuple[str, Optional[bytes]]],
                          tokenizer_dir: str,
                          record_creator: Callable,
-                         post_processor_hook: Optional[str] = None):
+                         post_processor_hook: Optional[str] = None,
+                         worker_id: int = -1,
+                         shutdown_event: Optional[threading.Event] = None,
+                         ready_event: Optional[threading.Event] = None,
+                         failure_event: Optional[threading.Event] = None):
     # Pass the hook import path; PostprocWorker builds it once.
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addrs,
                             tokenizer_dir=tokenizer_dir,
                             record_creator=record_creator,
-                            post_processor_hook=post_processor_hook)
-    worker.start()
+                            post_processor_hook=post_processor_hook,
+                            worker_id=worker_id,
+                            shutdown_event=shutdown_event)
+    try:
+        worker.start(ready_event=ready_event, failure_event=failure_event)
+    finally:
+        worker.close()

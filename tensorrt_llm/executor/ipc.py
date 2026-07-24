@@ -227,6 +227,30 @@ class ZeroMqQueue:
                 else:
                     logger.error(f"Failed to send object: {obj}")
 
+    def put_bounded(self, obj: Any, timeout: float) -> bool:
+        """Best-effort sync send that cannot wait forever for a peer."""
+        try:
+            self.setup_lazily()
+            self._check_thread_safety()
+            data = self._prepare_data(obj)
+            deadline = time.monotonic() + timeout
+
+            while True:
+                try:
+                    self._send_data(data, flags=zmq.NOBLOCK)
+                    return True
+                except zmq.Again:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error(
+                            f"Timed out sending object on queue {self.name}")
+                        return False
+                    time.sleep(min(0.01, remaining))
+        except Exception as e:
+            logger.error(f"Error sending object on queue {self.name}: {e}")
+            logger.error(traceback.format_exc())
+            return False
+
     async def put_async(self, obj: Any, routing_id: Optional[bytes] = None):
         self.setup_lazily()
         self._check_thread_safety()
@@ -262,6 +286,31 @@ class ZeroMqQueue:
             logger.error(f"Error sending object: {e}")
             logger.error(traceback.format_exc())
             raise e
+
+    async def put_async_bounded(self, obj: Any, timeout: float) -> bool:
+        """Best-effort async send that cannot wait forever for a peer."""
+        try:
+            self.setup_lazily()
+            self._check_thread_safety()
+            data = self._prepare_data(obj)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+
+            while True:
+                try:
+                    await self.socket.send(data, flags=zmq.NOBLOCK)
+                    return True
+                except zmq.Again:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        logger.error(
+                            f"Timed out sending object on queue {self.name}")
+                        return False
+                    await asyncio.sleep(min(0.01, remaining))
+        except Exception as e:
+            logger.error(f"Error sending object on queue {self.name}: {e}")
+            logger.error(traceback.format_exc())
+            return False
 
     def get(self) -> Any:
         self.setup_lazily()
@@ -346,8 +395,10 @@ class ZeroMqQueue:
                 if not events:
                     raise asyncio.TimeoutError()
 
-    def close(self):
+    def close(self, linger_ms: Optional[int] = None):
         if self.socket:
+            if linger_ms is not None:
+                self.socket.setsockopt(zmq.LINGER, linger_ms)
             self.socket.close()
             self.socket = None
         if self.context:
@@ -547,6 +598,13 @@ class FusedIpcQueue:
             batch = obj if isinstance(obj, list) else [obj]
             self.queue.put(batch)
 
+    def put_bounded(self, obj: Any, timeout: float) -> bool:
+        if self.fuse_message:
+            raise RuntimeError(
+                "Bounded send is unsupported when message fusion is enabled")
+        batch = obj if isinstance(obj, list) else [obj]
+        return self.queue.put_bounded(batch, timeout)
+
     def get(self) -> Any:
         return self.queue.get()
 
@@ -563,8 +621,11 @@ class FusedIpcQueue:
                 f"IPCQueue: {self._message_counter} messages, {self._obj_counter} objects sent, average: {self._obj_counter/self._message_counter}.\n",
                 "green")
 
-    def close(self):
-        self.queue.close()
+    def close(self, linger_ms: Optional[int] = None):
+        if linger_ms is None:
+            self.queue.close()
+        else:
+            self.queue.close(linger_ms=linger_ms)
 
         if self._send_thread is not None:
             self._send_thread.stop()
