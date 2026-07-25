@@ -1,9 +1,12 @@
 import gc
+import json
 import os
+import signal
+import socket
+import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,18 +14,18 @@ import zmq
 
 from tensorrt_llm.logger import logger
 
+from .. import serialization
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs
-from ..llmapi.mpi_session import set_mpi_session_cpp
+from ..llmapi.mpi_session import set_mpi_session_cpp, split_mpi_env
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
-                              postproc_worker_main)
+from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
@@ -158,6 +161,142 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                 self.engine.wait_shutdown()
 
 
+_POSTPROC_WORKER_COMMAND = """
+import os, sys
+for _fd in map(int, os.listdir("/proc/self/fd")):
+    if _fd > 2:
+        try:
+            os.close(_fd)
+        except OSError:
+            pass
+
+import json
+sys.path[:] = json.loads(sys.argv[1])
+from tensorrt_llm import serialization
+from tensorrt_llm.executor.postproc_worker import PostprocWorker
+_feedin, _feedouts, _tokenizer, _hook = serialization.load(sys.stdin.buffer)
+_worker = PostprocWorker(
+    _feedin, _feedouts, tokenizer_dir=_tokenizer,
+    record_creator=PostprocWorker.default_record_creator,
+    post_processor_hook=_hook)
+try:
+    _worker._pull_pipe.setup_lazily()
+    for _pipe in _worker._push_pipes:
+        _pipe.setup_lazily()
+    os.write(0, b"R")
+    _worker.start()
+finally:
+    for _pipe in [_worker._pull_pipe, *_worker._push_pipes]:
+        _pipe.close()
+"""
+
+
+def _wait_postproc_workers(pids: List[int], grace_timeout: float) -> None:
+    """Reap sidecars, escalating to TERM/KILL after the existing sentinel."""
+    for sig, timeout in ((None, grace_timeout), (signal.SIGTERM, 10),
+                         (signal.SIGKILL, 10)):
+        if sig is not None:
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + timeout
+        first_poll = True
+        while pids and (first_poll or time.monotonic() < deadline):
+            first_poll = False
+            for pid in pids.copy():
+                try:
+                    waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pids.remove(pid)
+                else:
+                    if waited_pid:
+                        pids.remove(pid)
+            if pids and time.monotonic() < deadline:
+                time.sleep(0.05)
+        if not pids:
+            return
+    logger.error(f"Could not reap postprocessing workers: {pids}")
+
+
+def _spawn_postproc_worker(spec: tuple, pids: List[int]) -> socket.socket:
+    """Launch one postprocessor without forking the live MPI rank."""
+    parent_socket, child_socket = socket.socketpair()
+    try:
+        if min(parent_socket.fileno(), child_socket.fileno()) <= 2:
+            raise RuntimeError("Postprocessing worker requires standard FDs")
+        child_env, _ = split_mpi_env()
+        child_env["TLLM_DISABLE_MPI"] = "1"
+        executable = os.path.abspath(sys.executable)
+        pid = os.posix_spawn(
+            executable,
+            [
+                executable, "-I", "-S", "-c", _POSTPROC_WORKER_COMMAND,
+                json.dumps([
+                    str(Path(__file__).resolve().parents[2]),
+                    *[p for p in sys.path if p and os.path.isabs(p)]
+                ])
+            ],
+            child_env,
+            file_actions=[
+                (os.POSIX_SPAWN_DUP2, child_socket.fileno(), 0),
+                (os.POSIX_SPAWN_CLOSE, parent_socket.fileno()),
+                (os.POSIX_SPAWN_CLOSE, child_socket.fileno()),
+            ],
+            setsigmask=(),
+            setsigdef=(signal.SIGTERM, signal.SIGINT),
+        )
+        pids.append(pid)
+        child_socket.close()
+        parent_socket.sendall(serialization.dumps(spec))
+        return parent_socket
+    except BaseException:
+        parent_socket.close()
+        raise
+    finally:
+        child_socket.close()
+
+
+def _start_postproc_workers(result_queues: List[FusedIpcQueue],
+                            proxy_result_addrs: list,
+                            config: PostprocWorkerConfig) -> List[int]:
+    pids: List[int] = []
+    control_sockets: List[socket.socket] = []
+    try:
+        for worker_id, result_queue in enumerate(result_queues):
+            spec = (
+                result_queue.address,
+                list(proxy_result_addrs),
+                (str(config.postprocess_tokenizer_dir)
+                 if config.postprocess_tokenizer_dir is not None else None),
+                config.post_processor_hook,
+            )
+            control_sockets.append(_spawn_postproc_worker(spec, pids))
+            logger.info(
+                f"Launched postprocessing worker {worker_id} (pid={pids[-1]})")
+
+        timeout = float(os.getenv("TLLM_POSTPROC_WORKER_READY_TIMEOUT", "300"))
+        deadline = time.monotonic() + timeout
+        for control_socket, pid in zip(control_sockets, pids):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Postprocessing workers did not become ready")
+            control_socket.settimeout(remaining)
+            if control_socket.recv(1) != b"R":
+                raise RuntimeError(
+                    f"Postprocessing worker pid={pid} exited before READY")
+            logger.info(f"Postprocessing worker pid={pid} is ready")
+        return pids
+    except BaseException:
+        _wait_postproc_workers(pids, grace_timeout=0)
+        raise
+    finally:
+        for control_socket in control_sockets:
+            control_socket.close()
+
+
 @print_traceback_on_error
 def worker_main(
     engine: Path,
@@ -210,7 +349,7 @@ def worker_main(
     logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
 
     result_queue: Optional[IpcQueue] = None
-    result_queues: Optional[List[IpcQueue]] = None
+    result_queues: Optional[List[FusedIpcQueue]] = None
     resource_governor_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
@@ -279,6 +418,8 @@ def worker_main(
                                          fuse_message=False,
                                          name="worker_result_queue")
 
+    postproc_worker_pids: List[int] = []
+
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in every frontend proxy to quit
         if result_queue is not None:
@@ -288,32 +429,10 @@ def worker_main(
                 q.put(None)
         else:
             assert result_queues is not None
+            if not postproc_worker_pids:
+                return
             for q in result_queues:
                 q.put(None)
-
-    postprocess_worker_futures = []
-    if is_leader and postproc_worker_config.enabled:
-        logger_debug(f"initiate postprocess workers...", "yellow")
-
-        # Each postproc worker pushes to every frontend result lane (a
-        # single lane in single-frontend mode).
-        proxy_result_addrs = (multi_frontend_addrs
-                              if multi_frontend_addrs is not None else
-                              [worker_queues.result_queue_addr])
-
-        assert result_queues is not None
-        postproc_worker_pool = ProcessPoolExecutor(
-            max_workers=postproc_worker_config.num_postprocess_workers)
-        for i in range(postproc_worker_config.num_postprocess_workers):
-            fut = postproc_worker_pool.submit(
-                postproc_worker_main,
-                result_queues[i].address,
-                proxy_result_addrs,
-                postproc_worker_config.postprocess_tokenizer_dir,
-                PostprocWorker.default_record_creator,
-                postproc_worker_config.post_processor_hook,
-            )
-            postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process
     #   1. During Executor initialization, the errors will be captured and
@@ -364,7 +483,23 @@ def worker_main(
 
             if is_leader:
                 if postproc_worker_config.enabled:
+                    assert result_queues is not None
                     worker.set_postproc_queues(result_queues)
+                    proxy_result_addrs = (multi_frontend_addrs if
+                                          multi_frontend_addrs is not None else
+                                          [worker_queues.result_queue_addr])
+                    try:
+                        postproc_worker_pids = _start_postproc_workers(
+                            result_queues,
+                            proxy_result_addrs,
+                            postproc_worker_config,
+                        )
+                    except Exception as e:
+                        if not worker_init_status_queue.notify_with_retry(
+                            (e, traceback.format_exc())):
+                            logger.error(
+                                "Failed to report postprocessor startup error")
+                        raise
                 elif frontend_result_queues is not None:
                     worker.set_frontend_result_queues(frontend_result_queues)
                 else:
@@ -398,6 +533,7 @@ def worker_main(
                         raise ValueError(f"Unknown request type: {type(req)}")
 
                 notify_proxy_threads_to_quit()
+                _wait_postproc_workers(postproc_worker_pids, grace_timeout=10)
 
         except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
@@ -409,3 +545,6 @@ def worker_main(
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e
+        finally:
+            if is_leader:
+                _wait_postproc_workers(postproc_worker_pids, grace_timeout=0)
