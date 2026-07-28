@@ -371,17 +371,31 @@ class Mamba2Metadata:
                         "call.")
                 self.state_indices = indices
             elif isinstance(indices, torch.Tensor):
-                # CPU tensor → bulk H2D
-                self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
+                # Snapshot into a fresh pinned allocation before the async H2D.
+                # The overlap scheduler can prepare the next iteration while
+                # this copy is still queued; reusing state_indices_cpu as the
+                # source would let the next batch-order update clobber the
+                # current request-to-state mapping.
+                staged_state_indices = torch.empty(
+                    batch_size,
+                    dtype=torch.int32,
+                    device='cpu',
+                    pin_memory=prefer_pinned())
+                staged_state_indices.copy_(indices[:batch_size])
                 self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                    staged_state_indices, non_blocking=True)
             else:
-                # indices is a Python sequence (e.g. List[int]); data
-                # already lives on host, CPU staging is fine.
-                for i, idx in enumerate(indices):
-                    self.state_indices_cpu[i] = idx
+                # A fresh pinned snapshot is required here as well.  The
+                # caching host allocator keeps it alive until the asynchronous
+                # H2D finishes, so a later scheduler iteration cannot mutate
+                # the source of this iteration's copy.
+                staged_state_indices = torch.tensor(
+                    indices[:batch_size],
+                    dtype=torch.int32,
+                    device='cpu',
+                    pin_memory=prefer_pinned())
                 self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                    staged_state_indices, non_blocking=True)
 
         # Refresh the int64 mirror once per step (outside the decode graph)
         # so layers can index pools without a per-layer cast kernel.

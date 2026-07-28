@@ -2245,8 +2245,19 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 )
             self._host_state_indices[:n] = values
 
-        self.cuda_state_indices.copy_(self._host_state_indices,
-                                      non_blocking=True)
+        # Snapshot the persistent host buffer before the async H2D.  The
+        # overlap scheduler can rewrite _host_state_indices for the next
+        # iteration while this copy is still queued; a private pinned source
+        # prevents old and compacted request-to-state mappings from mixing.
+        # The caching host allocator keeps the snapshot alive until its copy
+        # completes.
+        staged_state_indices = torch.empty(
+            self._host_state_indices.shape,
+            dtype=torch.int32,
+            device='cpu',
+            pin_memory=prefer_pinned())
+        staged_state_indices.copy_(self._host_state_indices)
+        self.cuda_state_indices.copy_(staged_state_indices, non_blocking=True)
         self._refresh_dummy_request_mask(
             [req.is_dummy for req in self.requests])
 
