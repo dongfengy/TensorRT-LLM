@@ -376,12 +376,17 @@ class Mamba2Metadata:
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
             else:
-                # indices is a Python sequence (e.g. List[int]); data
-                # already lives on host, CPU staging is fine.
-                for i, idx in enumerate(indices):
-                    self.state_indices_cpu[i] = idx
+                # A fresh pinned snapshot is required here.  The
+                # caching host allocator keeps it alive until the asynchronous
+                # H2D finishes, so a later scheduler iteration cannot mutate
+                # the source of this iteration's copy.
+                staged_state_indices = torch.tensor(
+                    indices[:batch_size],
+                    dtype=torch.int32,
+                    device='cpu',
+                    pin_memory=prefer_pinned())
                 self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                    staged_state_indices, non_blocking=True)
 
         # Refresh the int64 mirror once per step (outside the decode graph)
         # so layers can index pools without a per-layer cast kernel.
