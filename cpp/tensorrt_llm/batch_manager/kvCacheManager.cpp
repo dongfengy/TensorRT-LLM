@@ -1589,6 +1589,59 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     return result;
 }
 
+SizeType32 WindowBlockManager::probeReusablePrefixLen(GenerationRequest const& sequence, SizeType32 inputLength,
+    SizeType32 numContextBlocks, LlmRequest const& llmRequest, SizeType32 maxMatchedTokens) const
+{
+    TLLM_CHECK_WITH_INFO(
+        !isRecurrentState() || inputLength == llmRequest.getPromptLen(), "Recurrent state does not support CP yet.");
+
+    std::vector<BlockKey> blockKeys;
+    bool const isSelfCache = mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY;
+    bool const hasUniqueTokens = isSelfCache
+        || (llmRequest.getEncoderUniqueTokens().has_value() && llmRequest.getEncoderUniqueTokens().value());
+    if (hasUniqueTokens)
+    {
+        auto constexpr beamIdx = 0;
+        auto const& uniqueTokens
+            = isSelfCache ? llmRequest.getUniqueTokens(beamIdx) : *(llmRequest.getEncoderUniqueTokens().value());
+        auto blockedUniqueTokens
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
+        if (inputLength % mTokensPerBlock == 1)
+        {
+            blockedUniqueTokens.emplace_back();
+        }
+        blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+    }
+
+    auto const beamWidth = sequence.getBeamWidth();
+    bool const isShareLastContextBlock = mCacheType == CacheType::kCROSS || inputLength % mTokensPerBlock == 0;
+    auto const numSharedContextBlocks
+        = (beamWidth > 1 && !isShareLastContextBlock) ? numContextBlocks - 1 : numContextBlocks;
+
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    auto const reuseMatches
+        = findReusableBlockMatches(blockKeys, mEnablePartialReuse, mCopyOnPartialReuse, maxMatchedTokens);
+
+    if (!isRecurrentState())
+    {
+        return std::min(reuseMatches.totalMatchedTokens, numSharedContextBlocks * mTokensPerBlock);
+    }
+
+    SizeType32 latestMatchingNonPlaceholderBlockIdx{-1};
+    auto const numClaimableMatches
+        = std::min(static_cast<SizeType32>(reuseMatches.matches.size()), numSharedContextBlocks);
+    for (SizeType32 bi = 0; bi < numClaimableMatches; ++bi)
+    {
+        auto const& match = reuseMatches.matches[bi];
+        TLLM_CHECK(!match.isPartialMatch);
+        if (!match.isTraversalOnly && match.block && !match.block->isPlaceholder())
+        {
+            latestMatchingNonPlaceholderBlockIdx = bi;
+        }
+    }
+    return (latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
+}
+
 WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(GenerationRequest& sequence,
     SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, size_t requestIdx,
     PartialClaimTracker& tracker, std::vector<ClaimResult>& claimResults)
@@ -2244,6 +2297,14 @@ std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
 {
     return mWindowBlockManagers.at(windowSize)
         .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+}
+
+SizeType32 BlockManager::probeReusablePrefixLen(GenerationRequest const& sequence, SizeType32 inputLength,
+    SizeType32 numContextBlocks, LlmRequest const& llmRequest, SizeType32 windowSize,
+    SizeType32 maxMatchedTokens) const
+{
+    return mWindowBlockManagers.at(windowSize)
+        .probeReusablePrefixLen(sequence, inputLength, numContextBlocks, llmRequest, maxMatchedTokens);
 }
 
 void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
@@ -3811,6 +3872,43 @@ void KVCacheManager::addSequenceBatch(
         sequences[i] = &seqIt->second;
     }
 
+    // A fixed window order cannot make multi-window reuse safe: recurrent snapshots,
+    // SWA traversal-only anchors, independent pool eviction, and partial matches can
+    // each make a different window the shortest one. Probe all windows before any
+    // claims, then converge on a cap that is a reusable boundary for every window.
+    //
+    // Keep the shared radix-tree lock across probe and claim. Window-level operations
+    // take the same recursive mutex, so their existing locking remains valid.
+    std::unique_lock<std::recursive_mutex> multiWindowReuseLock;
+    auto const& windowMetadata = mBlockManager.getWindowSizesMetadata();
+    bool const reconcileMultiWindowReuse = mEnableBlockReuse && windowMetadata.size() > 1;
+    if (reconcileMultiWindowReuse)
+    {
+        multiWindowReuseLock = std::unique_lock<std::recursive_mutex>(mBlockManager.getLookupTreeMutex());
+        for (size_t i = 0; i < n; ++i)
+        {
+            auto cap = std::numeric_limits<SizeType32>::max();
+            while (true)
+            {
+                auto reconciledCap = cap;
+                for (auto const& [windowSize, metadata] : windowMetadata)
+                {
+                    auto const inputLength = std::min(std::get<1>(requestInfos[i]), metadata.maxTokenNum);
+                    auto const numContextBlocks = tc::ceilDiv(inputLength, getTokensPerBlock());
+                    reconciledCap = std::min(reconciledCap,
+                        mBlockManager.probeReusablePrefixLen(*sequences[i], inputLength, numContextBlocks,
+                            llmRequests[i].get(), windowSize, cap));
+                }
+                if (reconciledCap == cap)
+                {
+                    break;
+                }
+                cap = reconciledCap;
+            }
+            sequences[i]->setCurrentPrepopulatedPromptLen(cap);
+        }
+    }
+
     // Track the minimum prepopulated length across all windows per sequence
     // (for VSWA with mixed isSWA flags).
     std::vector<SizeType32> minPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
@@ -3821,11 +3919,9 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
     // --- Iterate over all window sizes (single iteration for non-VSWA) ---
-    // Onboard longer windows first to match the assumption in setCurrentPrepopulatedPromptLen
-    // (longer windows can match longer tokens). Linear attention also benefits because it
-    // has more restrictions and is always the shortest match.
-    for (auto iter = mBlockManager.getWindowSizesMetadata().rbegin();
-         iter != mBlockManager.getWindowSizesMetadata().rend(); ++iter)
+    // Preserve the established descending order for allocation and event behavior.
+    // Multi-window reuse correctness comes from the reconciled cap above, not order.
+    for (auto iter = windowMetadata.rbegin(); iter != windowMetadata.rend(); ++iter)
     {
         auto const& [windowSize, metadata] = *iter;
         // Use maxTokenNum (= max(windowSize, maxSequenceLength) + sinkBubbleLength) as the cap.
@@ -3859,6 +3955,10 @@ void KVCacheManager::addSequenceBatch(
             totalReusedDelta[i] += stats.reusedDelta;
             totalMissedDelta[i] += stats.missedDelta;
         }
+    }
+    if (multiWindowReuseLock.owns_lock())
+    {
+        multiWindowReuseLock.unlock();
     }
 
     // --- Finalize: set prepopulated length and per-request stats ---

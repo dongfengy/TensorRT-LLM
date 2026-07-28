@@ -982,6 +982,14 @@ public:
         std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& numContextBlocksVec,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse);
 
+    //! \brief Probe the effective reusable prefix without claiming or allocating blocks.
+    //! \details The result uses the same beam-sharing, partial-match, SWA traversal, and
+    //!          recurrent-snapshot rules as addSequenceBatch. It is capped by
+    //!          \p maxMatchedTokens and may be smaller when that cap is not a reusable
+    //!          boundary for this window.
+    [[nodiscard]] SizeType32 probeReusablePrefixLen(GenerationRequest const& sequence, SizeType32 inputLength,
+        SizeType32 numContextBlocks, LlmRequest const& llmRequest, SizeType32 maxMatchedTokens) const;
+
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams);
@@ -1537,6 +1545,17 @@ public:
         std::vector<SizeType32> const& numContextBlocksVec,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize,
         bool isEnableBlockReuse);
+
+    //! \brief Probe one window's effective reusable prefix without claiming blocks.
+    [[nodiscard]] SizeType32 probeReusablePrefixLen(GenerationRequest const& sequence, SizeType32 inputLength,
+        SizeType32 numContextBlocks, LlmRequest const& llmRequest, SizeType32 windowSize,
+        SizeType32 maxMatchedTokens) const;
+
+    //! \brief Shared radix-tree mutex used to keep multi-window probe and claim atomic.
+    [[nodiscard]] std::recursive_mutex& getLookupTreeMutex()
+    {
+        return mLookupTree.getMutex();
+    }
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
