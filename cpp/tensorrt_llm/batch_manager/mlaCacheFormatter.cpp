@@ -166,6 +166,19 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     TLLM_CHECK_WITH_INFO(
         static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
 
+    // Filter out recurrent state windows — handled by RnnCacheFormatter. Their
+    // block lists contain placeholder blocks with no memory backing, which the
+    // BlockIterator cannot slice.
+    std::vector<SizeType32> kvWindowSizes;
+    kvWindowSizes.reserve(windowSizes.size());
+    for (auto const& ws : windowSizes)
+    {
+        if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            kvWindowSizes.push_back(ws);
+        }
+    }
+
     for (auto transferIndexerKCache : transferringIndexerKCache)
     {
         auto bufferKind = transferIndexerKCache ? static_cast<uint8_t>(BufferKind::kKV_INDEXER)
@@ -179,7 +192,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
         if (!transferIndexerKCache)
         {
-            for (auto const& windowSize : windowSizes)
+            for (auto const& windowSize : kvWindowSizes)
             {
                 auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
                 for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
@@ -191,7 +204,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         }
         else
         {
-            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSizes.at(0), true);
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(kvWindowSizes.at(0), true);
             for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {
                 inputKvCacheBlocks.push_back(it);
@@ -449,6 +462,20 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     TLLM_CHECK_WITH_INFO(
         static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
+
+    // Filter out recurrent state windows — handled by RnnCacheFormatter. Their
+    // block lists contain placeholder blocks with no memory backing, which the
+    // BlockIterator cannot slice.
+    std::vector<SizeType32> kvWindowSizes;
+    kvWindowSizes.reserve(windowSizes.size());
+    for (auto const& ws : windowSizes)
+    {
+        if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            kvWindowSizes.push_back(ws);
+        }
+    }
+
     bool hasIndexerKCache = mCacheManager->getIndexerKCachePool() != nullptr;
     std::vector<bool> transferringIndexerKCache;
     transferringIndexerKCache.push_back(false);
@@ -463,7 +490,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         size_t blockNum = 0;
         if (!transferIndexerKCache)
         {
-            for (auto const& windowSize : windowSizes)
+            for (auto const& windowSize : kvWindowSizes)
             {
                 auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
                 for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
@@ -475,7 +502,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         }
         else
         {
-            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSizes.at(0), true);
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(kvWindowSizes.at(0), true);
             for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {
                 outputBuffers.push_back(it);
