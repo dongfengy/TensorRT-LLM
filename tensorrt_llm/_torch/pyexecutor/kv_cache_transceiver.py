@@ -287,6 +287,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
 
+        self.kv_cache_manager = kv_cache_manager
         self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
                                         total_num_kv_heads_per_layer, head_dim,
                                         tokens_per_block, world_config,
@@ -297,6 +298,15 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
+
+    def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
+        # Insert the received prompt blocks into this executor's radix tree so
+        # the next turn of the conversation claims them and the context
+        # executor transfers only the new suffix. Block keys are rebuilt from
+        # the request's token ids at store time; no wire metadata is needed.
+        if not self.kv_cache_manager.enable_block_reuse:
+            return
+        self.kv_cache_manager.store_blocks_for_reuse(req, pin_blocks=False)
 
     def request_and_receive_sync(self, req: LlmRequest):
         return self.impl.request_and_receive_sync(req)

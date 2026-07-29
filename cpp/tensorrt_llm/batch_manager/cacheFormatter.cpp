@@ -183,11 +183,54 @@ void sendAllBuffers(TransferSession& session, int deviceId,
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+std::optional<SizeType32> getSingleAttentionWindow(BaseKVCacheManager const* cacheManager)
+{
+    std::optional<SizeType32> attentionWindow;
+    for (auto const& [windowSize, metadata] : cacheManager->getBlockManager().getWindowSizesMetadata())
+    {
+        if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
+        {
+            continue;
+        }
+        if (attentionWindow.has_value())
+        {
+            return std::nullopt; // more than one attention window (true VSWA)
+        }
+        attentionWindow = windowSize;
+    }
+    return attentionWindow;
+}
+
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+
+    // Hybrid linear-attention models (one attention window + recurrent-state
+    // windows): serve the receiver's delta request with a positional slice of
+    // the attention window. The receiver derives its list as
+    // [reusedBlocks, usedBlocks) and sends indexFromEnd = count - 1, so the
+    // slice anchored at the end-of-prompt block matches it exactly. The
+    // recurrent windows keep their full block-id lists: RnnCacheFormatter
+    // selects the end-of-prompt block positionally and transfers only that.
+    auto const attentionWindow = getSingleAttentionWindow(cacheManager);
+    bool const isHybrid = attentionWindow.has_value()
+        && cacheManager->getBlockManager().getWindowSizesMetadata().size() > 1;
+    if (isHybrid && cacheManager->isEnableBlockReuse() && lastBlockKey.uniqueTokens.size() > 0 && !recvSideHasCP
+        && ppSize == 1)
+    {
+        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        auto const& blockIds = blockRange.getBlockIdsPerWindow().at(*attentionWindow);
+        auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const endBlockIdx = static_cast<SizeType32>((llmRequest.getPromptLen() - 1) / tokensPerBlock);
+        TLLM_CHECK_WITH_INFO(endBlockIdx < static_cast<SizeType32>(blockIds.size()),
+            "end-of-prompt block %d outside the attention block list (%zu)", endBlockIdx, blockIds.size());
+        SizeType32 const firstBlockIdx = std::max(0, endBlockIdx - indexFromEnd);
+        blockRange.setBlockIdsForWindow(*attentionWindow,
+            std::vector<SizeType32>(blockIds.begin() + firstBlockIdx, blockIds.begin() + endBlockIdx + 1));
+        return blockRange;
+    }
 
     // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
     // distributed among CP ranks. So, we transfer all blocks from send side.
@@ -258,10 +301,20 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO: Remove the condition on the PP size once disagg support from KVCache reuse
     // path is fixed.
-    if (poolNum == 1 && srcEnableBlockReuse && srcEnablePartialReuse && !recvSideHasCP && srcPpSize == 1)
+    // Hybrid linear-attention models join the delta path through their single
+    // attention window (partial reuse is force-disabled for them, so the
+    // arithmetic below floors to full blocks, which is exactly their reuse
+    // granularity). Recurrent windows keep full block-id lists for the
+    // positional RnnCacheFormatter contract.
+    auto const attentionWindow = getSingleAttentionWindow(cacheManager);
+    bool const isHybrid = attentionWindow.has_value()
+        && cacheManager->getBlockManager().getWindowSizesMetadata().size() > 1;
+    if (((poolNum == 1 && srcEnablePartialReuse) || isHybrid) && srcEnableBlockReuse && !recvSideHasCP
+        && srcPpSize == 1)
     {
         // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
-        auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
+        auto windowSize = isHybrid ? *attentionWindow
+                                   : cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
         auto range = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
         auto const& allBlockIds = range.getBlockIdsPerWindow().at(windowSize);
         auto const totalBlocks = static_cast<SizeType32>(allBlockIds.size());

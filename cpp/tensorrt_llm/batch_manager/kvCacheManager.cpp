@@ -3820,14 +3820,15 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalReusedDelta(n, 0);
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
-    // Disaggregated generation requests receive their complete cache from the
-    // context executor (the transfer covers every block of the prompt), so
-    // claiming reuse blocks for them buys nothing: the incoming transfer would
-    // overwrite blocks that other live sequences may still reference through
-    // the radix tree. Allocate fresh blocks instead.
+    // Disaggregated generation requests claim ATTENTION blocks so the cache
+    // transfer can skip what this executor already holds (the receive-side
+    // delta slices to new blocks only, so the transfer never writes into a
+    // claimed, tree-shared block). The RECURRENT window is excluded: its
+    // transfer contract is the single end-of-prompt block, which is never
+    // claimable, and a recurrent claim would drag prepopulatedPromptLen
+    // below the attention match through the min-fold.
     bool const anyDisaggGenInit = std::any_of(llmRequests.begin(), llmRequests.end(),
         [](auto const& r) { return r.get().isDisaggGenerationInitState(); });
-    bool const enableReuseForBatch = mEnableBlockReuse && !anyDisaggGenInit;
 
     // --- Iterate over all window sizes (single iteration for non-VSWA) ---
     // Onboard longer windows first to match the assumption in setCurrentPrepopulatedPromptLen
@@ -3837,6 +3838,9 @@ void KVCacheManager::addSequenceBatch(
          iter != mBlockManager.getWindowSizesMetadata().rend(); ++iter)
     {
         auto const& [windowSize, metadata] = *iter;
+        bool const skipRecurrentReuse
+            = anyDisaggGenInit && LinearAttentionMetadata::hasRecurrentStatesCache(windowSize);
+        bool const enableReuseForWindow = mEnableBlockReuse && !skipRecurrentReuse;
         // Use maxTokenNum (= max(windowSize, maxSequenceLength) + sinkBubbleLength) as the cap.
         // For SWA, blocks are allocated linearly for the full prompt; out-of-window blocks are
         // only detached during generation in adjustBlocksIfNeeded.
@@ -3854,7 +3858,7 @@ void KVCacheManager::addSequenceBatch(
 
         // Two-phase claim-then-onboard for this window
         auto const windowResults = mBlockManager.addSequenceBatch(
-            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, enableReuseForBatch);
+            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, enableReuseForWindow);
 
         // Update offsets and accumulate stats
         for (size_t i = 0; i < n; ++i)
@@ -3862,7 +3866,10 @@ void KVCacheManager::addSequenceBatch(
             mBlockManager.updateSequenceCacheBlockOffsets(*sequences[i], windowSize);
 
             auto const& stats = windowResults[i];
-            minPrepopulatedLen[i] = std::min(minPrepopulatedLen[i], stats.prepopulatedLen);
+            if (!skipRecurrentReuse)
+            {
+                minPrepopulatedLen[i] = std::min(minPrepopulatedLen[i], stats.prepopulatedLen);
+            }
             totalAllocTotalDelta[i] += stats.allocTotalDelta;
             totalAllocNewDelta[i] += stats.allocNewDelta;
             totalReusedDelta[i] += stats.reusedDelta;
@@ -3875,7 +3882,7 @@ void KVCacheManager::addSequenceBatch(
     {
         auto& llmRequest = llmRequests[i].get();
 
-        if (enableReuseForBatch)
+        if (mEnableBlockReuse)
         {
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
                 minPrepopulatedLen[i], llmRequest.mRequestId);
