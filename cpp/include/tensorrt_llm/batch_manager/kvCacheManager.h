@@ -209,21 +209,32 @@ struct LinearAttentionMetadata
         {
             return 1;
         }
-        SizeType32 count = 0;
+        // Count exactly the blocks shouldAllocateRecurrentStates() marks real,
+        // by block end-token index: block bi ends at (bi+1) * tokensPerBlock.
+        // Any disagreement with the allocator lets the capacity scheduler admit
+        // a request the recurrent pool cannot hold.
+        SizeType32 const lastBlockEnd = (promptLen + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+        // The block holding the end of the sequence is always allocated.
+        SizeType32 count = 1;
         if (statesSnapshotInterval > 0)
         {
-            count += promptLen / statesSnapshotInterval; // round down
+            // Interval snapshots among the block ends, minus the one that
+            // coincides with the end-of-sequence block.
+            count += lastBlockEnd / statesSnapshotInterval;
+            if (lastBlockEnd % statesSnapshotInterval == 0)
+            {
+                count -= 1;
+            }
         }
-        if (saveLastSnapshot
-            && (promptLen / tokensPerBlock * tokensPerBlock
-                != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+        if (saveLastSnapshot)
         {
-            count += 1;
-        }
-        if (promptLen % tokensPerBlock == 0)
-        {
-            // corner case
-            count += 1;
+            // The last full block, when distinct from both rules above.
+            SizeType32 const lastFullBlockEnd = promptLen / tokensPerBlock * tokensPerBlock;
+            if (lastFullBlockEnd != lastBlockEnd && lastFullBlockEnd > 0
+                && (statesSnapshotInterval <= 0 || lastFullBlockEnd % statesSnapshotInterval != 0))
+            {
+                count += 1;
+            }
         }
         return count;
     }

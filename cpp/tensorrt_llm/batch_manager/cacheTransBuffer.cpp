@@ -191,6 +191,31 @@ bool FabricMemory::supportFabricMemory()
 // CacheTransBufferManager Implementation
 // ============================================================================
 
+namespace
+{
+//! \brief First layer whose pool is an attention KV pool (not recurrent states).
+//!
+//! The KV transfer buffer stages attention KV blocks only; recurrent-state
+//! blocks of hybrid linear-attention models travel through the
+//! RnnCacheTransBufferManager. Hybrid models may place a linear-attention
+//! layer at index 0, so "layer 0's pool" is not necessarily an attention KV
+//! pool. For non-hybrid models this returns 0, matching the previous
+//! behavior exactly.
+SizeType32 firstAttentionKvLayer(KVCacheManager::BaseKVCacheManager* cacheManager)
+{
+    auto const& blockManager = cacheManager->getBlockManager();
+    for (SizeType32 layerId = 0; layerId < blockManager.getNumLayers(); layerId++)
+    {
+        auto const windowSize = blockManager.getPoolWindowSize(blockManager.getLayerPoolIdx(layerId));
+        if (!LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
+        {
+            return layerId;
+        }
+    }
+    TLLM_THROW("No attention KV pool found for the KV cache transfer buffer");
+}
+} // namespace
+
 size_t CacheTransBufferManager::computeTransferBufferSize(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
 {
@@ -201,7 +226,7 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
     }
     else
     {
-        dataType = cacheManager->getPrimaryPool(0)->getDataType();
+        dataType = cacheManager->getPrimaryPool(firstAttentionKvLayer(cacheManager))->getDataType();
     }
 
     auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
@@ -219,13 +244,19 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
         }
         else
         {
-            auto primaryPool = cacheManager->getPrimaryPool(0);
+            auto primaryPool = cacheManager->getPrimaryPool(firstAttentionKvLayer(cacheManager));
             kvCacheByteSizePerTokenPerLayer
                 = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
         }
         for (auto layerId = 0; layerId < cacheManager->getBlockManager().getNumLayers(); layerId++)
         {
             auto poolIdx = cacheManager->getBlockManager().getLayerPoolIdx(layerId);
+            if (LinearAttentionMetadata::hasRecurrentStatesCache(
+                    cacheManager->getBlockManager().getPoolWindowSize(poolIdx)))
+            {
+                // Recurrent-state layers are staged by the RnnCacheTransBufferManager.
+                continue;
+            }
             auto windowSize = static_cast<size_t>(cacheManager->getBlockManager().getPoolWindowSize(poolIdx));
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
@@ -246,7 +277,7 @@ CacheTransBufferManager::CacheTransBufferManager(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
     : BaseTransBufferManager(computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache),
         transferIndexerKCache ? cacheManager->getIndexerKCachePool()->getDataType()
-                              : cacheManager->getPrimaryPool(0)->getDataType(),
+                              : cacheManager->getPrimaryPool(firstAttentionKvLayer(cacheManager))->getDataType(),
         maxNumTokens)
     , mCacheManager{cacheManager}
     , mTransferIndexerKCache{transferIndexerKCache}
@@ -262,17 +293,25 @@ CacheTransBufferManager::CacheTransBufferManager(
     // code paths.
     if (!transferIndexerKCache)
     {
-        auto const numKvPools = mCacheManager->getBlockManager().getNumPools(
-            /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-        auto const dtype0 = mCacheManager->getPrimaryPool(0)->getDataType();
-        for (SizeType32 i = 1; i < numKvPools; ++i)
+        // Compare per-layer pool dtypes against the canonical attention KV
+        // dtype, skipping recurrent-state pools (they travel through the
+        // RnnCacheTransBufferManager with their own dtype).
+        auto const& blockManager = mCacheManager->getBlockManager();
+        auto const canonicalLayer = firstAttentionKvLayer(mCacheManager);
+        auto const dtype0 = mCacheManager->getPrimaryPool(canonicalLayer)->getDataType();
+        for (SizeType32 layerId = 0; layerId < blockManager.getNumLayers(); ++layerId)
         {
-            auto const dtypeI = mCacheManager->getPrimaryPool(i)->getDataType();
+            if (LinearAttentionMetadata::hasRecurrentStatesCache(
+                    blockManager.getPoolWindowSize(blockManager.getLayerPoolIdx(layerId))))
+            {
+                continue;
+            }
+            auto const dtypeI = mCacheManager->getPrimaryPool(layerId)->getDataType();
             TLLM_CHECK_WITH_INFO(dtypeI == dtype0,
                 "Disaggregated KV cache transfer does not yet support pools with differing dtypes "
-                "(pool 0 dtype=%d, pool %d dtype=%d). TODO(disagg-multi-dtype): per-pool dtype "
+                "(layer %d dtype=%d, layer %d dtype=%d). TODO(disagg-multi-dtype): per-pool dtype "
                 "dispatch in formatter.",
-                static_cast<int>(dtype0), i, static_cast<int>(dtypeI));
+                canonicalLayer, static_cast<int>(dtype0), layerId, static_cast<int>(dtypeI));
         }
     }
     TLLM_LOG_INFO("CacheTransBufferManager created for KV cache");

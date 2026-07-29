@@ -130,15 +130,28 @@ void RnnCacheFormatter::format(TransferSession& session)
             int const numHeadsLocal = rnnModel.mNumHeads / selfTPPerDP;
             auto const globalSectionDims = rnnModel.getConvSectionDims();
 
-            // Collect real block indices
+            // Transfer only the block covering the end of the prompt: the
+            // "end of sequence" rule in shouldAllocateRecurrentStates()
+            // guarantees it is a real, sequence-owned block that holds the
+            // final prefill state - the only recurrent state decode needs.
+            // Interval snapshots are a sender-side reuse optimization and
+            // must not leak into the wire contract: under a reuse claim the
+            // sender's snapshot positions become placeholder sentinels
+            // (getBlockById returns nullptr for them), so per-side "all real
+            // blocks" lists would diverge between sender and receiver.
+            // Selecting the end block keeps both sides' lists identical by
+            // construction.
             std::vector<SizeType32> realBlockIndices;
-            for (auto const& blockId : it->second)
             {
-                auto const& block = blockManager.getBlockById(blockId, ws);
-                if (!block->isPlaceholder())
-                {
-                    realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
-                }
+                auto const tokensPerBlock = blockManager.getTokensPerBlock();
+                auto const promptLen = llmRequest.getPromptLen();
+                auto const endBlockPos = static_cast<size_t>((promptLen - 1) / tokensPerBlock);
+                TLLM_CHECK_WITH_INFO(endBlockPos < it->second.size(),
+                    "end-of-prompt block %zu outside recurrent block list (%zu)", endBlockPos, it->second.size());
+                auto const& block = blockManager.getBlockById(it->second.at(endBlockPos), ws);
+                TLLM_CHECK_WITH_INFO(block && !block->isPlaceholder(),
+                    "final recurrent-state block must be sequence-owned and real");
+                realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
             }
 
             if (realBlockIndices.empty())
@@ -335,15 +348,28 @@ void RnnCacheFormatter::unformat(TransferSession& session)
             int const numHeadsLocal = rnnModel.mNumHeads / selfTPPerDP;
             auto const globalSectionDims = rnnModel.getConvSectionDims();
 
-            // Collect real block indices
+            // Transfer only the block covering the end of the prompt: the
+            // "end of sequence" rule in shouldAllocateRecurrentStates()
+            // guarantees it is a real, sequence-owned block that holds the
+            // final prefill state - the only recurrent state decode needs.
+            // Interval snapshots are a sender-side reuse optimization and
+            // must not leak into the wire contract: under a reuse claim the
+            // sender's snapshot positions become placeholder sentinels
+            // (getBlockById returns nullptr for them), so per-side "all real
+            // blocks" lists would diverge between sender and receiver.
+            // Selecting the end block keeps both sides' lists identical by
+            // construction.
             std::vector<SizeType32> realBlockIndices;
-            for (auto const& blockId : it->second)
             {
-                auto const& block = blockManager.getBlockById(blockId, ws);
-                if (!block->isPlaceholder())
-                {
-                    realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
-                }
+                auto const tokensPerBlock = blockManager.getTokensPerBlock();
+                auto const promptLen = llmRequest.getPromptLen();
+                auto const endBlockPos = static_cast<size_t>((promptLen - 1) / tokensPerBlock);
+                TLLM_CHECK_WITH_INFO(endBlockPos < it->second.size(),
+                    "end-of-prompt block %zu outside recurrent block list (%zu)", endBlockPos, it->second.size());
+                auto const& block = blockManager.getBlockById(it->second.at(endBlockPos), ws);
+                TLLM_CHECK_WITH_INFO(block && !block->isPlaceholder(),
+                    "final recurrent-state block must be sequence-owned and real");
+                realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
             }
 
             if (realBlockIndices.empty())
