@@ -1590,8 +1590,9 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
 }
 
 SizeType32 WindowBlockManager::probeReusablePrefixLen(GenerationRequest const& sequence, SizeType32 inputLength,
-    SizeType32 numContextBlocks, LlmRequest const& llmRequest, SizeType32 maxMatchedTokens) const
+    LlmRequest const& llmRequest, SizeType32 maxMatchedTokens) const
 {
+    auto const numContextBlocks = tc::ceilDiv(inputLength, mTokensPerBlock);
     TLLM_CHECK_WITH_INFO(
         !isRecurrentState() || inputLength == llmRequest.getPromptLen(), "Recurrent state does not support CP yet.");
 
@@ -2297,14 +2298,6 @@ std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
 {
     return mWindowBlockManagers.at(windowSize)
         .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
-}
-
-SizeType32 BlockManager::probeReusablePrefixLen(GenerationRequest const& sequence, SizeType32 inputLength,
-    SizeType32 numContextBlocks, LlmRequest const& llmRequest, SizeType32 windowSize,
-    SizeType32 maxMatchedTokens) const
-{
-    return mWindowBlockManagers.at(windowSize)
-        .probeReusablePrefixLen(sequence, inputLength, numContextBlocks, llmRequest, maxMatchedTokens);
 }
 
 void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
@@ -3872,13 +3865,8 @@ void KVCacheManager::addSequenceBatch(
         sequences[i] = &seqIt->second;
     }
 
-    // A fixed window order cannot make multi-window reuse safe: recurrent snapshots,
-    // SWA traversal-only anchors, independent pool eviction, and partial matches can
-    // each make a different window the shortest one. Probe all windows before any
-    // claims, then converge on a cap that is a reusable boundary for every window.
-    //
-    // Keep the shared radix-tree lock across probe and claim. Window-level operations
-    // take the same recursive mutex, so their existing locking remains valid.
+    // Reconcile a common reusable boundary before any window claims. Hold the
+    // shared tree lock through all claims so the plan stays valid.
     std::unique_lock<std::recursive_mutex> multiWindowReuseLock;
     auto const& windowMetadata = mBlockManager.getWindowSizesMetadata();
     bool const reconcileMultiWindowReuse = mEnableBlockReuse && windowMetadata.size() > 1;
@@ -3894,11 +3882,12 @@ void KVCacheManager::addSequenceBatch(
                 for (auto const& [windowSize, metadata] : windowMetadata)
                 {
                     auto const inputLength = std::min(std::get<1>(requestInfos[i]), metadata.maxTokenNum);
-                    auto const numContextBlocks = tc::ceilDiv(inputLength, getTokensPerBlock());
                     reconciledCap = std::min(reconciledCap,
-                        mBlockManager.probeReusablePrefixLen(*sequences[i], inputLength, numContextBlocks,
-                            llmRequests[i].get(), windowSize, cap));
+                        mBlockManager.getWindowBlockManager(windowSize).probeReusablePrefixLen(
+                            *sequences[i], inputLength, llmRequests[i].get(), cap));
                 }
+                // Do not let concurrent requests alias an in-place partial leaf.
+                reconciledCap = reconciledCap / getTokensPerBlock() * getTokensPerBlock();
                 if (reconciledCap == cap)
                 {
                     break;
