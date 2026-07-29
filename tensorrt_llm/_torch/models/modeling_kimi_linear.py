@@ -1161,6 +1161,14 @@ class KimiKDARuntime(nn.Module):
         conv_pool.index_copy_(
             0, slot_indices,
             torch.cat([conv_q, conv_k, conv_v], dim=1).to(conv_pool.dtype))
+        # Clamp the committed recurrent state. On degenerate long prompts the
+        # chunked-prefill UT-transform can emit huge-but-finite state values;
+        # those later overflow the decode kernel's state-key dot product to
+        # inf, and 0*inf NaNs poison the state pool and the logits
+        # (all-rank TensorCompare device asserts). Healthy K3 states are
+        # O(1e3), so 1e6 is inert headroom for real traffic.
+        final_state = torch.nan_to_num(final_state, nan=0.0, posinf=1.0e6,
+                                       neginf=-1.0e6).clamp_(-1.0e6, 1.0e6)
         ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
