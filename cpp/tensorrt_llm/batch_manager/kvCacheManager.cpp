@@ -3820,6 +3820,15 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalReusedDelta(n, 0);
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
+    // Disaggregated generation requests receive their complete cache from the
+    // context executor (the transfer covers every block of the prompt), so
+    // claiming reuse blocks for them buys nothing: the incoming transfer would
+    // overwrite blocks that other live sequences may still reference through
+    // the radix tree. Allocate fresh blocks instead.
+    bool const anyDisaggGenInit = std::any_of(llmRequests.begin(), llmRequests.end(),
+        [](auto const& r) { return r.get().isDisaggGenerationInitState(); });
+    bool const enableReuseForBatch = mEnableBlockReuse && !anyDisaggGenInit;
+
     // --- Iterate over all window sizes (single iteration for non-VSWA) ---
     // Onboard longer windows first to match the assumption in setCurrentPrepopulatedPromptLen
     // (longer windows can match longer tokens). Linear attention also benefits because it
@@ -3845,7 +3854,7 @@ void KVCacheManager::addSequenceBatch(
 
         // Two-phase claim-then-onboard for this window
         auto const windowResults = mBlockManager.addSequenceBatch(
-            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, mEnableBlockReuse);
+            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, enableReuseForBatch);
 
         // Update offsets and accumulate stats
         for (size_t i = 0; i < n; ++i)
@@ -3866,7 +3875,7 @@ void KVCacheManager::addSequenceBatch(
     {
         auto& llmRequest = llmRequests[i].get();
 
-        if (mEnableBlockReuse)
+        if (enableReuseForBatch)
         {
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
                 minPrepopulatedLen[i], llmRequest.mRequestId);
