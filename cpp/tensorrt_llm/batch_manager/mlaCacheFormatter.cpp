@@ -627,8 +627,11 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                         = bufferCoverTargetNum == 0 ? 0 : processIdx % bufferCoverTargetNum + remainNoCoverTargetNum;
                     auto recvBufferUsed
                         = bufferCoverTargetNum == 0 ? preAllocRecvBuffer : recvSplitCaches[recvBufferIdx];
-                    // bufferCoverTargetNum==0
-                    size_t remainRecvSize = recvBufferUsed->getSize();
+                    // bufferCoverTargetNum==0: loop over the FULL needed size in
+                    // buffer-sized windows, mirroring the sender (and the generic
+                    // CacheFormatter). Initializing from the staging buffer size
+                    // received only one window of a multi-window transfer.
+                    size_t remainRecvSize = recvSplitCaches.at(processIdx)->getSize();
                     size_t needRecvSize = recvSplitCaches.at(processIdx)->getSize();
                     while (remainRecvSize > 0)
                     {
