@@ -2115,10 +2115,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
-        # - enable_block_reuse defaults off: reuse is supported as an
-        #   explicit opt-in (routes to CppMambaHybridCacheManager with
-        #   per-block KDA state snapshots); the default stays on the
-        #   Mixed manager, which SA speculative decoding requires.
+        # - use_kv_cache_manager_v2 defaults on: Kimi K3 uses the unified
+        #   attention/KDA state pools and snapshot-aware reuse policy.
+        # - enable_block_reuse defaults off: reuse remains an explicit opt-in
+        #   because it also requires a recurrent-state snapshot policy.
         # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
         #   rejects the MLA (576, 512) generation kernel (marked slower) and
         #   the fallback C++ path requires num_heads % 64 == 0, which K3's
@@ -2127,6 +2127,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "tokens_per_block": 64,
+                "use_kv_cache_manager_v2": True,
             }
         }
 
