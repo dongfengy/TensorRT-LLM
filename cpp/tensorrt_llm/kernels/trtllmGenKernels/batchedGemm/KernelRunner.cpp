@@ -102,21 +102,13 @@ static inline bool skipQuirks(BatchedGemmConfig const& config)
     // exact cubin hash so a rebuilt payload re-enables automatically. Named:
     // bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x256u2_s6_et128x8_m128x8x32_c1x1x2_rM_splitK2_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
     // bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x512_s3_et128x8_m128x8x32_c1x1x2_rM_splitK2_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
-    constexpr char const* corruptSplitKHashes[]
-        = {"b22a179046c59f62468931ab30e0719d25c027156c326058e532caafba6617de",
-            "a1cfcb3d01af4ae7e6cb78712a7bdbef6f3f7e44c5beb58b9922befe3dbaabd2"};
-    bool corrupt_splitk_fc2 = false;
-    if (config.mHash != nullptr)
-    {
-        for (auto const* hash : corruptSplitKHashes)
-        {
-            if (std::strcmp(config.mHash, hash) == 0)
-            {
-                corrupt_splitk_fc2 = true;
-                break;
-            }
-        }
-    }
+    // Empirical update: filtering only the two hashes above moved the failure
+    // to the remaining siblings (same signature reappeared with the re-tuned
+    // tactic selection), so the whole 6-cubin splitK2 family of this dtype
+    // combination is implicated — they share the cross-CTA reduction scheme.
+    bool const corrupt_splitk_fc2 = config.mFunctionName != nullptr
+        && strstr(config.mFunctionName, "Bfloat16_MxE2m1MxE4m3") != nullptr
+        && strstr(config.mFunctionName, "splitK") != nullptr;
 
     return hang_c2x1_bM || hang_schedS_tmaOob_tileN64 || corrupt_splitk_fc2;
 }
