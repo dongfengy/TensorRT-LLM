@@ -19,6 +19,7 @@
 
 #include "cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include <optional>
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -189,6 +190,15 @@ using BlockRange = kv_cache_manager::BlockRange;
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     bool srcEnableBlockReuse, bool srcEnablePartialReuse, bool recvSideHasCP = false, SizeType32 srcPpSize = 1);
+
+//! \brief The single attention window of a hybrid linear-attention model, if any.
+//!
+//! Returns the unique non-recurrent window size (whether or not
+//! recurrent-state windows sit next to it), nullopt when there are multiple
+//! attention windows (true VSWA) or none.
+//! Needed because the recurrent window key is negative and sorts first, so
+//! `.begin()` window picks would select it for hybrid models.
+std::optional<SizeType32> getSingleAttentionWindow(BaseKVCacheManager const* cacheManager);
 
 // Used to support the cache transmission with different layouts and different protocols.
 class BaseCacheFormatter

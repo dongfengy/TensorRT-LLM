@@ -1085,15 +1085,20 @@ public:
 
         RequestInfo requestInfo(requestId, mSelfState);
 
-        if (!mCacheTransferLayer.getCacheManager()->getBlockManager().isVariableWindow())
+        auto* cacheManager = mCacheTransferLayer.getCacheManager();
+        // A single attention window (possibly next to recurrent-state windows,
+        // which have their own fixed transfer contract) is enough for the
+        // reuse-aware RequestInfo; only true multi-attention-window VSWA is out.
+        auto const attentionWindow = kv_cache_manager::getSingleAttentionWindow(cacheManager);
+        if (attentionWindow.has_value())
         {
-            auto* cacheManager = mCacheTransferLayer.getCacheManager();
             auto const srcPpSize = destCacheState.getParallelConfig().mPipelineParallelism;
             auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest,
                 destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse(),
                 /*recvSideHasCP=*/false, srcPpSize);
 
-            int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
+            int32_t requestedBlockSize
+                = requestedBlockRange.getBlockIdsPerWindow().at(*attentionWindow).size();
             // An empty Helix CP rank owns zero KV blocks for this sequence (fewer blocks than
             // cp_size). It still sends a RequestInfo so the context's per-request counterpart count
             // is satisfied, but requests zero blocks: the default RequestInfo (indexFromEnd=0, empty
