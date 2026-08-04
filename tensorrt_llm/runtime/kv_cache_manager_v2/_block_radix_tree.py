@@ -458,6 +458,12 @@ class Block:
         curr = start
         while (
             (isinstance(curr, Block) and curr.storage[lc_idx] is None)
+            # Detach only blocks with no live page in ANY life cycle. A chain tip
+            # that lost its unheld SSM snapshot page to eviction still carries live
+            # attention pages of an in-flight sequence; detaching it (and cascading
+            # through its then-childless ancestors) orphans the sequence's committed
+            # chain, and its next incremental commit dereferences a dangling rawref.
+            and not any(s is not None and s() is not None for s in curr.storage)
             and not curr.next
             and curr._prev() is not None
         ):
