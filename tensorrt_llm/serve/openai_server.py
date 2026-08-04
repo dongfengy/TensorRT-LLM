@@ -1507,9 +1507,22 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
-            except:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first chunk,
+                # so we cannot change the status code. Yield an SSE error
+                # event so the stream terminates cleanly instead of breaking
+                # the HTTP connection (mirrors completion_stream_generator).
+                error_data = json.dumps({
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": None,
+                        "param": None,
+                    }
+                })
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
         try:
             ensure_request_chat_template_allowed(

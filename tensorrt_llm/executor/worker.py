@@ -81,6 +81,14 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def start_thread(self, thread: ManagedThread):
         if self.engine.can_enqueue_requests() and not thread.is_alive():
+            if thread.ident is not None:
+                # The thread ran and died (e.g. the executor event loop hit a
+                # fatal error). Restarting a Thread object raises the opaque
+                # "threads can only be started once"; surface the real state
+                # instead so callers fail fast rather than serving a zombie.
+                raise RuntimeError(
+                    f"{thread.name} has terminated; the executor is no "
+                    "longer able to process requests.")
             thread.start()
 
     def await_response_task(self) -> bool:

@@ -4629,7 +4629,20 @@ class PyExecutor:
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
-                    assert sample_state is not None, "Sampling failed"
+                    if sample_state is None:
+                        # The forward or sampling step failed and
+                        # _handle_errors() has already terminated the affected
+                        # requests. Drop this batch and keep the executor loop
+                        # alive so a request-scoped failure (e.g. a transient
+                        # allocator OOM on one attention-DP rank) does not
+                        # brick the whole server. Peer ranks blocked in a
+                        # collective this rank abandoned recover through their
+                        # own communication timeouts and take this same path.
+                        logger.error(
+                            "Sampling failed; dropping the scheduled batch "
+                            "after error handling and continuing.")
+                        self.previous_batch = None
+                        continue
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
