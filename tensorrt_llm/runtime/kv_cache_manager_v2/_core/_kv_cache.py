@@ -1025,7 +1025,12 @@ class _KVCache:
                         ),
                         move_ssm=is_end,
                     )
-                if has_partial_snapshot:
+                    # _commit_block transitions out of ALLOWED (to USER_STOP) when a
+                    # block cannot be committed (VIRTUAL_STOP). Stop here so we don't
+                    # re-enter _commit_block on an already-stopped cache.
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        break
+                if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
                     partial_ordinal = BlockOrdinal(new_num_full_blocks)
                     if is_end:
                         self._commit_block(
@@ -1560,6 +1565,11 @@ class _KVCache:
             prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
+            # Same orphaned-chain defense as _commit_block: skip this
+            # best-effort snapshot rather than crash on a dangling rawref.
+            # No state transition — the commit path owns that decision.
+            if prev.is_orphan:
+                return
         try:
             tree_block = Block(tokens, prev)
             is_new = True
@@ -1629,6 +1639,20 @@ class _KVCache:
             prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
+            # A concurrent removal (page-eviction stale-block cleanup or
+            # subtree removal) can detach our previously committed chain from
+            # the radix tree between incremental commit() calls. Committing on
+            # top of an orphaned block would dereference a dangling rawref;
+            # stop committing this sequence instead of crashing the executor.
+            # Mid-prefill this must stay VIRTUAL_STOP (commit() no-ops on it,
+            # while USER_STOP makes the next chunk's commit() raise); a final
+            # commit must land in USER_STOP so save_drop_plan stays legal.
+            if prev.is_orphan:
+                self._commit_state = (
+                    self.CommitState.USER_STOP if is_last else self.CommitState.VIRTUAL_STOP
+                )
+                self._on_stop_committing()
+                return
         try:
             tree_block = Block(tokens, prev)
             is_new = True

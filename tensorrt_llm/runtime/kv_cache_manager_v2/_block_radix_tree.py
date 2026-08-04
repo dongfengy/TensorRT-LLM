@@ -344,7 +344,16 @@ class Block:
         return Hasher(prev_key).update(tokens).digest
 
     def __init__(self, tokens: Sequence[TokenIdExt], prev: "Block | RootBlock") -> None:
-        assert prev.tokens_per_block == prev.prev.tokens_per_block, "prev must be a full block"
+        # The full-block sanity check must not dereference prev's ancestors
+        # unconditionally: a concurrently detached prev has _prev == NULL and
+        # the old form (prev.tokens_per_block == prev.prev.tokens_per_block)
+        # raised "Dereferencing a dangling rawref" on the hot commit path.
+        assert (
+            NDEBUG
+            or isinstance(prev, RootBlock)
+            or prev.is_orphan
+            or len(prev.tokens) == prev.tokens_per_block
+        ), "prev must be a full block"
         self.key = self.make_key(prev.key, tokens)
         self.tokens = tokens
         self.ordinal = BlockOrdinal(prev.ordinal + 1)
@@ -458,6 +467,14 @@ class Block:
         curr = start
         while (
             (isinstance(curr, Block) and curr.storage[lc_idx] is None)
+            # Only detach blocks with no live page in ANY life cycle. A chain
+            # tip that lost its (evictable, unheld) SSM snapshot page still
+            # carries live attention pages held by an in-flight sequence;
+            # detaching it — and then cascading through its now-childless
+            # ancestors, whose SSM slots are empty by construction — would
+            # orphan the sequence's committed chain and make its next
+            # incremental commit dereference a dangling rawref.
+            and not any(s is not None and s() is not None for s in curr.storage)
             and not curr.next
             and curr._prev() is not None
         ):
