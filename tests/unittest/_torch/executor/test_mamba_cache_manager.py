@@ -1686,7 +1686,10 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     mgr.enable_stats = False
     mgr.num_extra_kv_tokens = 0
     mgr.get_layer_bytes_per_token = lambda **kwargs: 8
-    mgr._minimum_live_gpu_quota = lambda: 0
+    mgr.is_estimating_kv_cache = True
+    mgr._minimum_live_gpu_quota = MagicMock(
+        side_effect=AssertionError("estimation must use native constraint floors")
+    )
     kv_cache_config = KvCacheConfig(
         enable_partial_reuse=True,
         avg_seq_len=96,
@@ -1737,6 +1740,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     )
     assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 2 * 96
     assert not hasattr(config.typical_step.kv_caches[0], "num_ssm_slots")
+    mgr._minimum_live_gpu_quota.assert_not_called()
 
 
 def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):

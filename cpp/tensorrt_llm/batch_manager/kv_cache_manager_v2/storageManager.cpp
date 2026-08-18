@@ -57,7 +57,8 @@ size_t CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
     case CacheTier::GPU_MEM:
     {
         constexpr size_t kPageSize = 2ULL << 20;
-        return kPageSize << std::min(4, std::max(0, static_cast<int>(std::log2(quota / (kPageSize * 512)))));
+        auto const scale = std::max<size_t>(1, quota / (kPageSize * 512));
+        return kPageSize << std::min(4, static_cast<int>(std::log2(scale)));
     }
     case CacheTier::HOST_MEM: return HostMem::kAlignment; // 4 KiB
     case CacheTier::DISK: return size_t{2} << 20;         // DiskCacheLevelStorage::POOL_SIZE_GRANULARITY

@@ -764,6 +764,63 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("configured_windows", "expected_windows"),
+    [
+        (None, [128, 4096, 128, 4096]),
+        ([256, 4096, 256, 4096], [256, 4096, 256, 4096]),
+    ],
+)
+def test_v2_manager_uses_model_windows_unless_user_configured(
+    configured_windows,
+    expected_windows,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+
+    captured_configs = []
+
+    class _RecordingKVCacheManagerV2(KVCacheManagerV2):
+        def __init__(self, kv_cache_config, _kv_cache_type, **kwargs) -> None:
+            captured_configs.append(kv_cache_config)
+
+    pretrained = SimpleNamespace(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=4,
+        vocab_size=32000,
+        layer_types=["sliding_attention", "full_attention"] * 2,
+        sliding_window=128,
+    )
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+    model_config.quant_config = None
+    model_engine = Mock()
+    model_engine.model.model_config = model_config
+    model_engine.model.draft_config = None
+    model_engine.dtype = torch.bfloat16
+    model_engine.is_draft_model = False
+    kv_cache_config = KvCacheConfig(max_attention_window=configured_windows)
+
+    _create_kv_cache_manager(
+        model_engine=model_engine,
+        kv_cache_manager_cls=_RecordingKVCacheManagerV2,
+        mapping=Mock(),
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=32,
+        max_seq_len=4096,
+        max_batch_size=8,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=333,
+        max_beam_width=1,
+        kv_connector_manager=None,
+    )
+
+    assert captured_configs[0].max_attention_window == expected_windows
+    assert kv_cache_config.max_attention_window == configured_windows
+
+
 def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
@@ -830,12 +887,14 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     ):
         assert creator.try_prepare_estimation()
         assert kv_cache_config.max_tokens == estimation_max_tokens
+        assert kv_cache_config.max_gpu_total_bytes == 1
         assert kv_cache_config.pool_ratio is None
         assert kv_cache_config.avg_seq_len == max_seq_len
 
         creator.configure_kv_cache_capacity()
 
     assert kv_cache_config.max_tokens == user_max_tokens
+    assert kv_cache_config.max_gpu_total_bytes == 512
     assert kv_cache_config.pool_ratio == pool_ratio
     assert kv_cache_config.avg_seq_len == avg_seq_len
 
@@ -952,3 +1011,67 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
     assert draft_config.pool_ratio == [1.0]
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
+
+
+@pytest.mark.parametrize("estimating_kv_cache", [True, False])
+def test_separate_one_model_draft_preserves_derived_windows(
+    estimating_kv_cache,
+) -> None:
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_cache_config = KvCacheConfig(max_attention_window=None)
+    creator._max_seq_len = 4096
+    creator._tokens_per_block = 32
+    creator._max_batch_size = 8
+    creator._max_num_tokens = 4096
+    creator._max_beam_width = 1
+    creator._kv_connector_manager = None
+    creator._skip_est = False
+    creator._execution_stream = None
+    creator._is_disagg = False
+    creator._mapping = Mock()
+    creator._speculative_config = Mock()
+
+    effective_draft_config = Mock()
+    effective_draft_config.pretrained_config.torch_dtype = "bfloat16"
+    effective_draft_config.sparse_attention_config = None
+    draft_windows = [128, 4096]
+
+    with (
+        patch.object(creator, "_get_num_draft_layers", return_value=2),
+        patch.object(
+            creator,
+            "_get_one_model_draft_layer_mask",
+            return_value=[True, True],
+        ),
+        patch.object(
+            creator,
+            "_get_effective_draft_config",
+            return_value=effective_draft_config,
+        ),
+        patch.object(
+            creator,
+            "_get_draft_max_attention_window",
+            return_value=draft_windows,
+        ),
+        patch.object(creator, "_enable_kv_cache_stats", return_value=False),
+        patch.object(
+            creator,
+            "_validate_or_fallback_kv_cache_manager_v2",
+            return_value=KVCacheManagerV2,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=KVCacheManagerV2,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+            return_value=Mock(),
+        ) as create_manager,
+    ):
+        creator._create_one_model_draft_kv_cache_manager(
+            creator._max_seq_len,
+            estimating_kv_cache=estimating_kv_cache,
+        )
+
+    draft_config = create_manager.call_args.kwargs["kv_cache_config"]
+    assert draft_config.max_attention_window == draft_windows

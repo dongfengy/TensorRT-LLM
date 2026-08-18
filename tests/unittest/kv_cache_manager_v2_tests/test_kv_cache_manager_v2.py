@@ -70,7 +70,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
     from kv_cache_manager_v2._storage._core import CacheLevelStorage, PoolGroupBase, SlotAllocator
-    from kv_cache_manager_v2._storage_manager import StorageManager
+    from kv_cache_manager_v2._storage_manager import CacheLevelManager, StorageManager
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -128,7 +128,10 @@ else:
         PoolGroupBase,
         SlotAllocator,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageManager
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import (
+        CacheLevelManager,
+        StorageManager,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -161,6 +164,11 @@ requires_python_backend = unittest.skipIf(
     KV_CACHE_MANAGER_V2_BACKEND == "cpp",
     "white-box test over pure-Python KVCacheManagerV2 internals",
 )
+
+
+def test_minimum_positive_gpu_quota_uses_base_granularity():
+    assert CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, 1) == 2 << 20
+    assert CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, 1 << 30) == 2 << 20
 
 
 def get_cached_cuda_event_type():
@@ -3155,14 +3163,10 @@ class TestInitRatioConfig(unittest.TestCase):
         mgr_constrained.shutdown()
 
     def test_constraint_reserves_resume_headroom(self):
-        """A full constraint batch must stay below the resume utilization gate."""
+        """A minimum request is promoted to a resumable constraint floor."""
         num_requests = 32
         constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
-        granularity = 2 << 20
-        gpu_quota = round_up(num_requests * self.PG0_SLOT_SIZE, granularity) + round_up(
-            num_requests * self.PG1_SLOT_SIZE, granularity
-        )
-        cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
+        cfg = self._make_config(gpu_quota=1, constraints=[constraint])
         cfg.max_util_for_resume = 0.95
         manager = KVCacheManager(cfg)
         stream_holder = CachedCudaStream()

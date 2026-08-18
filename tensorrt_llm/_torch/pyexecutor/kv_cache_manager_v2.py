@@ -970,8 +970,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # Sync resumable token capacity across ranks so the scheduler produces
         # identical batches. Normalize to tokens because cache costs vary
-        # across PP ranks, including fixed per-rank costs.
-        if mapping.world_size > 1:
+        # across PP ranks, including fixed per-rank costs. The throwaway
+        # estimation managers instead use the identical declared constraints
+        # on every rank; synchronizing their one-byte requested quota can round
+        # a full-attention rank down to zero before native constraint floors
+        # are applied.
+        if mapping.world_size > 1 and not self.is_estimating_kv_cache:
             dist = Distributed.get(mapping)
             resumable_quota = int(quota * max_util_for_resume)
             max_tokens = self._get_max_tokens_from_quota(resumable_quota)

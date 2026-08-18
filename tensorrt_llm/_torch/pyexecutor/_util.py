@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import dataclasses
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
@@ -81,6 +80,11 @@ if TYPE_CHECKING:
     import transformers
 
 GB = 1 << 30
+
+# V2 promotes every positive tier quota to the exact feasibility floor derived
+# from its declared warmup constraints. Request the smallest positive quota
+# during profiling so the temporary cache cannot consume activation headroom.
+_V2_ESTIMATION_MIN_REQUESTED_QUOTA_BYTES = 1
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -428,25 +432,46 @@ def _normalize_attention_windows(
     return normalized
 
 
+def _derive_model_max_attention_window(
+    pretrained_config: object,
+    max_seq_len: int,
+    num_layers: int,
+) -> Optional[List[int]]:
+    """Derive the effective per-layer attention windows from model metadata."""
+    layer_windows = [
+        get_layer_attention_window(pretrained_config, layer_idx)
+        for layer_idx in range(num_layers)
+    ]
+    if not any(window is not None for window in layer_windows):
+        return None
+    return _normalize_attention_windows(layer_windows, max_seq_len)
+
+
 def _get_num_pool_groups_for_estimation(
     model_config: object,
     max_seq_len: int,
-    fallback_attention_windows: Optional[List[Optional[int]]],
+    configured_attention_windows: Optional[List[Optional[int]]],
 ) -> int:
     """Infer the number of V2 KV-cache pools needed during estimation.
 
-    Sliding/full-attention hybrids are best distinguished by their effective
-    windows. Hybrid linear-attention models with mixed layer types fall back to
-    their distinct layer types. Unsupported target window metadata must not
-    make estimation fail; in that
-    case preserve the legacy layer-type/window heuristic.
+    Explicitly configured windows are authoritative. Otherwise,
+    sliding/full-attention hybrids are best distinguished by their effective
+    model windows. Hybrid linear-attention models with mixed layer types fall
+    back to their distinct layer types. Unsupported target window metadata
+    must not make estimation fail.
     """
+    if configured_attention_windows is not None:
+        normalized_windows = _normalize_attention_windows(
+            configured_attention_windows, max_seq_len)
+        if normalized_windows is None:
+            return 1
+        return len(set(normalized_windows))
+
     num_layers = getattr(model_config, "num_hidden_layers", None)
     layer_types = getattr(model_config, "layer_types", None)
-    attention_windows = None
     if isinstance(num_layers, int) and num_layers > 0:
         try:
-            inferred_windows = [
+            layer_windows = [
                 get_layer_attention_window(model_config, layer_idx)
                 for layer_idx in range(num_layers)
             ]
@@ -455,29 +480,17 @@ def _get_num_pool_groups_for_estimation(
                 "Unable to infer target attention windows for KV-cache "
                 f"estimation ({error}); falling back to layer metadata.")
         else:
-            if any(window is not None for window in inferred_windows):
-                attention_windows = [
-                    max_seq_len if window is None else window
-                    for window in inferred_windows
-                ]
-
-    if attention_windows is not None:
-        normalized_windows = _normalize_attention_windows(
-            attention_windows, max_seq_len)
-        if normalized_windows is None:
-            return 1
-        return len(set(normalized_windows))
+            if any(window is not None for window in layer_windows):
+                normalized_windows = _normalize_attention_windows(
+                    layer_windows, max_seq_len)
+                if normalized_windows is None:
+                    return 1
+                return len(set(normalized_windows))
 
     if isinstance(layer_types, (list, tuple)):
         num_layer_types = len(set(layer_types))
         if num_layer_types > 1:
             return num_layer_types
-
-    if fallback_attention_windows is not None:
-        normalized_windows = _normalize_attention_windows(
-            fallback_attention_windows, max_seq_len)
-        if normalized_windows is not None:
-            return len(set(normalized_windows))
 
     return 1
 
@@ -1076,14 +1089,8 @@ class KvCacheCreator:
             self._kv_cache_config.pool_ratio = None
             self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
-                free_mem, _ = torch.cuda.mem_get_info()
-                max_gpu_total_bytes = int(
-                    self._kv_cache_config.free_gpu_memory_fraction * free_mem)
-                if (self._max_gpu_total_bytes_in is not None
-                        and self._max_gpu_total_bytes_in > 0):
-                    max_gpu_total_bytes = min(max_gpu_total_bytes,
-                                              self._max_gpu_total_bytes_in)
-                self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
+                self._kv_cache_config.max_gpu_total_bytes = (
+                    _V2_ESTIMATION_MIN_REQUESTED_QUOTA_BYTES)
                 self._kv_cache_config.max_tokens = max_tokens
             else:
                 self._kv_cache_config.max_tokens = max_tokens
@@ -1438,16 +1445,10 @@ class KvCacheCreator:
         self,
         kv_cache_config: KvCacheConfig,
         max_seq_len: int,
-        *,
-        estimating_kv_cache: bool = False,
     ) -> KvCacheConfig:
         """Return a clone with the draft manager's attention-window layout."""
-        # Estimation uses a small max_tokens-sized temporary draft cache before
-        # the measured GPU budget is available to split. Applying VSWA there
-        # would size every window pool from the unsplit free-memory budget.
-        max_attention_window = (None if estimating_kv_cache else
-                                self._get_draft_max_attention_window(
-                                    max_seq_len, kv_cache_config))
+        max_attention_window = self._get_draft_max_attention_window(
+            max_seq_len, kv_cache_config)
         return kv_cache_config.model_copy(
             update={"max_attention_window": max_attention_window})
 
@@ -1471,9 +1472,7 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         draft_kv_config = self._get_one_model_draft_kv_cache_config(
-            kv_cache_config,
-            max_seq_len,
-            estimating_kv_cache=estimating_kv_cache)
+            kv_cache_config, max_seq_len)
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
@@ -2162,6 +2161,23 @@ def _create_kv_cache_manager(
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
+    if (model_engine is not None
+            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
+            and kv_cache_type
+            == tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+            and kv_cache_config.max_attention_window is None):
+        try:
+            inferred_windows = _derive_model_max_attention_window(
+                config, max_seq_len, config.num_hidden_layers)
+        except (NotImplementedError, ValueError) as error:
+            logger.warning(
+                "Unable to infer target attention windows for KV-cache "
+                f"manager construction ({error}); using full attention.")
+        else:
+            if inferred_windows is not None:
+                kv_cache_config = kv_cache_config.model_copy(
+                    update={"max_attention_window": inferred_windows})
+
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
@@ -2171,17 +2187,13 @@ def _create_kv_cache_manager(
     if not isinstance(head_dim, int):
         head_dim = hidden_size // num_attention_heads
 
-    # Gemma4: build per-layer head_dim, num_kv_heads, and sliding window
-    # for hybrid attention. Different layer types need different KV cache
-    # pool groups (via max_attention_window) so FlashInfer page indices
-    # are consistent within each group.
+    # Gemma4: build per-layer head_dim and num_kv_heads for hybrid attention.
     if is_gemma4_hybrid(config):
         layer_types = config.layer_types
         global_head_dim = config.global_head_dim
         attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
         num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
                                        None) or num_key_value_heads)
-        sliding_window = getattr(config, 'sliding_window', None)
         head_dim_list = []
         kv_heads_list = []
         for lt in layer_types:
@@ -2196,25 +2208,6 @@ def _create_kv_cache_manager(
                     num_global_kv_heads if use_k_eq_v else num_key_value_heads)
         head_dim = head_dim_list
         num_key_value_heads = kv_heads_list
-
-        # Set per-layer max_attention_window so V2 creates separate pool
-        # groups for sliding vs full attention layers (different page sizes).
-        # Sliding layers use the model's sliding_window; full layers use
-        # max_seq_len.  V2 uses this to evict old blocks when kv_len >
-        # window, saving memory (only ~ceil(sliding_window/page_size)
-        # blocks per sequence for sliding layers, vs the full kv_len for
-        # full attention layers).  FlashInfer's prepare() reads the
-        # currently-allocated block IDs per pool from the V2 manager,
-        # so the smaller sliding-pool block count after eviction is
-        # picked up automatically.
-        if (kv_cache_config.max_attention_window is None
-                and sliding_window is not None):
-            kv_cache_config = copy.copy(kv_cache_config)
-            kv_cache_config.max_attention_window = [
-                int(sliding_window)
-                if lt == "sliding_attention" else int(max_seq_len)
-                for lt in layer_types
-            ]
 
     # Note: Gemma4 KV sharing is handled at the model level — shared layers
     # use cache_layer_idx to read from the target layer's cache slot via

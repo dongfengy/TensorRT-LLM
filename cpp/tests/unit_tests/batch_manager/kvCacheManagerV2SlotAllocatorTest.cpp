@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
 
 #include <gtest/gtest.h>
 
@@ -29,6 +30,13 @@ namespace
 {
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
+
+TEST(KvCacheManagerV2StorageTest, MinimumPositiveGpuQuotaUsesBaseGranularity)
+{
+    constexpr size_t kBaseGranularity = 2ULL << 20;
+    EXPECT_EQ(CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, 1), kBaseGranularity);
+    EXPECT_EQ(CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, 1ULL << 30), kBaseGranularity);
+}
 
 std::vector<Slot> allocateSlots(SlotAllocator& allocator, std::size_t count)
 {
