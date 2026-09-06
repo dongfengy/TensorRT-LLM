@@ -152,10 +152,10 @@ class TestSplitGpuBudgetForDraft:
             return_value=DraftCostKVCacheManager,
         )
 
-        # The draft layer stores 64 bytes/token in a fixed 512-token window.
+        # The draft layer stores scalable capacity for its 512-token window.
         # Leaking the target's 16K window would instead count it as 64 bytes/token.
         cost = creator._get_kv_size_per_token()
-        assert cost == CacheCost(slope=10, intercept=512 * 64)
+        assert cost == CacheCost(slope=10, batch_capacity=512 * 64)
         assert len(draft_kv_configs) == 1
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]

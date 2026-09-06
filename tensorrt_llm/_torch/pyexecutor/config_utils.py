@@ -77,6 +77,12 @@ def _is_sliding_attention_layer(layer_type: object) -> bool:
     return "sliding" in layer_type_name
 
 
+def is_attention_layer_type(layer_type: object) -> bool:
+    """Return whether a layer type denotes non-recurrent attention."""
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "attention" in layer_type_name and "linear" not in layer_type_name
+
+
 def get_layer_attention_window(
     config: object,
     layer_idx: int,

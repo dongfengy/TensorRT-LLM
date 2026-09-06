@@ -934,6 +934,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
+        max_cuda_graph_batch_size: Optional[int] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1008,6 +1009,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.max_cuda_graph_batch_size = max_cuda_graph_batch_size
         self.max_num_tokens = max_num_tokens
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         from tensorrt_llm._torch.speculative import draft_prompt_lookahead, get_num_extra_kv_tokens
@@ -2091,7 +2093,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
                 # CUDA graph generation warmup uses one request at max_seq_len and
-                # enough minimal decode requests to fill max_batch_size.
+                # enough minimal decode requests to fill the largest captured graph.
+                warmup_batch_size = self.max_batch_size
+                if self.max_cuda_graph_batch_size is not None:
+                    warmup_batch_size = min(self.max_batch_size, self.max_cuda_graph_batch_size)
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 constraints.append(
                     BatchDesc(
@@ -2102,7 +2107,7 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
                         ]
                         + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (self.max_batch_size - 1)
+                        * (warmup_batch_size - 1)
                     )
                 )
 
@@ -4229,10 +4234,9 @@ class KVCacheManagerV2(BaseResourceManager):
             required_slots = math.ceil(fixed_cost / bytes_per_slot)
             resume_util = float(np.float32(kv_cache_config.max_util_for_resume))
             fixed_cost = math.ceil(required_slots / resume_util) * bytes_per_slot
-        return (
-            cache_size_per_token,
-            fixed_cost,
-        )
+        if fixed_cost and not is_dflash_draft:
+            return cache_size_per_token, 0, fixed_cost
+        return cache_size_per_token, fixed_cost
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests):
         """Update KV cache for context requests in the current batch.

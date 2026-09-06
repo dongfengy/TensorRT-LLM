@@ -54,10 +54,10 @@ from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
-                           get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-                           uses_vswa_kv_cache_layout)
+                           get_layer_attention_window, is_attention_layer_type,
+                           is_gemma4_hybrid, is_hybrid_linear, is_kimi_linear,
+                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_qwen4_exp, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -323,6 +323,7 @@ def get_kv_cache_manager_cls(
 # shape so the rest of the file does plain attribute access and method calls
 # instead of branching on type. Managers are responsible for including any
 # pool-specific alignment or capacity headroom in the returned cost.
+# A third tuple field is scalable capacity used only for target/draft GPU splits.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -330,9 +331,11 @@ class CacheCost:
     """Affine KV cache budget: ``bytes = slope * tokens + intercept``.
 
     The legacy proportional case is just ``intercept = 0``.
+    ``batch_capacity`` is a split weight, not a fixed allocation.
     """
     slope: int
     intercept: int = 0
+    batch_capacity: int = 0
 
     @classmethod
     def from_raw(cls, raw) -> "CacheCost":
@@ -340,6 +343,11 @@ class CacheCost:
         if isinstance(raw, CacheCost):
             return raw
         if isinstance(raw, tuple):
+            if len(raw) == 3:
+                slope, intercept, batch_capacity = raw
+                return cls(slope=int(slope),
+                           intercept=int(intercept),
+                           batch_capacity=int(batch_capacity))
             slope, intercept = raw
             return cls(slope=int(slope), intercept=int(intercept))
         return cls(slope=int(raw))
@@ -348,13 +356,17 @@ class CacheCost:
         if not isinstance(other, CacheCost):
             return NotImplemented
         return CacheCost(slope=self.slope + other.slope,
-                         intercept=self.intercept + other.intercept)
+                         intercept=self.intercept + other.intercept,
+                         batch_capacity=self.batch_capacity +
+                         other.batch_capacity)
 
     def __str__(self) -> str:
+        if self.batch_capacity:
+            return (f"{self.slope} bytes/token + {self.intercept} bytes fixed "
+                    f"cost + {self.batch_capacity} bytes batch capacity")
         if self.intercept == 0:
             return f"{self.slope} bytes/token"
-        else:
-            return f"{self.slope} bytes/token + {self.intercept} bytes fixed cost"
+        return f"{self.slope} bytes/token + {self.intercept} bytes fixed cost"
 
     def tokens_for_budget(self, budget: int) -> int:
         """Memory budget -> max tokens. Clamps a negative result to 0."""
@@ -479,11 +491,14 @@ def _get_num_pool_groups_for_estimation(
     their distinct layer types. Unsupported target window metadata must not
     make estimation fail; in that
     case preserve the legacy layer-type/window heuristic.
+    Only windows passed to the manager create separate attention pools.
     """
     num_layers = getattr(model_config, "num_hidden_layers", None)
     layer_types = getattr(model_config, "layer_types", None)
     attention_windows = None
-    if isinstance(num_layers, int) and num_layers > 0:
+    windows_reach_manager = (fallback_attention_windows is not None
+                             or is_gemma4_hybrid(model_config))
+    if windows_reach_manager and isinstance(num_layers, int) and num_layers > 0:
         try:
             inferred_windows = [
                 get_layer_attention_window(model_config, layer_idx)
@@ -508,9 +523,16 @@ def _get_num_pool_groups_for_estimation(
         return len(set(normalized_windows))
 
     if isinstance(layer_types, (list, tuple)):
-        num_layer_types = len(set(layer_types))
-        if num_layer_types > 1:
-            return num_layer_types
+        if windows_reach_manager:
+            pool_types = set(layer_types)
+        else:
+            pool_types = {
+                "attention"
+                if is_attention_layer_type(layer_type) else layer_type
+                for layer_type in layer_types
+            }
+        if len(pool_types) > 1:
+            return len(pool_types)
 
     if fallback_attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
@@ -1699,10 +1721,13 @@ class KvCacheCreator:
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
-                             intercept=total_kv.intercept - target_kv.intercept)
+                             intercept=total_kv.intercept - target_kv.intercept,
+                             batch_capacity=total_kv.batch_capacity -
+                             target_kv.batch_capacity)
         costs = (target_kv, draft_kv)
-        if any(cost.slope < 0 or cost.intercept < 0 or (
-                cost.slope == 0 and cost.intercept == 0) for cost in costs):
+        if any(cost.slope < 0 or cost.intercept < 0 or cost.batch_capacity < 0
+               or (cost.slope == 0 and cost.intercept == 0
+                   and cost.batch_capacity == 0) for cost in costs):
             return None
         return target_kv, draft_kv
 
@@ -1714,23 +1739,29 @@ class KvCacheCreator:
     ) -> Optional[tuple[int, int]]:
         """Split *total_budget* into (target_budget, draft_budget) byte shares."""
         intercept_total = target_kv.intercept + draft_kv.intercept
-        slope_budget = total_budget - intercept_total
-        slope_total = target_kv.slope + draft_kv.slope
-        if slope_budget < 0:
+        variable_budget = total_budget - intercept_total
+        if variable_budget < 0:
             logger.warning(
                 f"KV cache budget {total_budget} is smaller than the fixed "
                 f"cache cost {intercept_total}; cannot split between "
                 f"target and draft.")
             return None
-        if slope_budget == 0 and slope_total > 0:
+        workload_tokens = (max(1, self._max_batch_size) *
+                           max(1, self._max_seq_len))
+        target_weight = (target_kv.batch_capacity +
+                         target_kv.slope * workload_tokens)
+        draft_weight = (draft_kv.batch_capacity +
+                        draft_kv.slope * workload_tokens)
+        weight_total = target_weight + draft_weight
+        if variable_budget == 0 and weight_total > 0:
             logger.warning(
                 f"KV cache budget {total_budget} leaves no capacity beyond "
                 f"the fixed cache cost {intercept_total}; cannot split "
-                f"between target and draft with a per-token cache cost.")
+                f"between target and draft with a scalable cache cost.")
             return None
-        draft_slope_share = (slope_budget * draft_kv.slope //
-                             slope_total if slope_total > 0 else 0)
-        draft_budget = draft_kv.intercept + draft_slope_share
+        draft_variable_share = (variable_budget * draft_weight //
+                                weight_total if weight_total > 0 else 0)
+        draft_budget = draft_kv.intercept + draft_variable_share
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
 
@@ -2515,6 +2546,9 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs["max_cuda_graph_batch_size"] = (
+            model_engine._max_cuda_graph_batch_size
+            if model_engine is not None else None)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

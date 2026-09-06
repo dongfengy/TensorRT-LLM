@@ -196,6 +196,8 @@ def _make_creator(
     use_sliding_window=None,
     max_attention_window=None,
     max_beam_width=1,
+    head_dim=None,
+    global_head_dim=None,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
     _get_token_num_for_estimation only."""
@@ -216,6 +218,8 @@ def _make_creator(
         num_hidden_layers=(len(layer_types) if isinstance(layer_types, (list, tuple)) else None),
         sliding_window=sliding_window,
         use_sliding_window=use_sliding_window,
+        head_dim=head_dim,
+        global_head_dim=global_head_dim,
     )
 
     model_config = Mock()
@@ -468,6 +472,8 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
         sliding_window=sliding_window,
+        head_dim=256,
+        global_head_dim=128,
     )
     uniform = _make_creator(
         tpb,
@@ -523,7 +529,7 @@ def test_hybrid_linear_attention_scales_by_num_pool_groups():
     ],
     ids=["multiple_window_sizes", "missing_window"],
 )
-def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
+def test_plain_v2_collapses_unsupported_full_sliding_metadata(
     sliding_window,
     use_sliding_window,
 ):
@@ -550,7 +556,7 @@ def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
         layer_types=["full_attention", "full_attention"],
     )
 
-    assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
+    assert hybrid._get_token_num_for_estimation() == uniform._get_token_num_for_estimation()
 
 
 def test_vswa_max_attention_window_fallback_scales():
@@ -603,6 +609,8 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
         sliding_window=sliding_window,
+        head_dim=256,
+        global_head_dim=128,
     )
 
     total_tokens = c._get_token_num_for_estimation()
@@ -649,7 +657,7 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
     )
 
     # Per layer: K+V * kv_heads * head_dim * bf16 bytes = 2 * 2 * 8 * 2.
-    expected = CacheCost(slope=64, intercept=3 * 2 * 2048 * 64)
+    expected = CacheCost(slope=64, batch_capacity=3 * 2 * 2048 * 64)
     assert no_scratch_size_per_token == expected
     assert scratch_size_per_token == expected
 
