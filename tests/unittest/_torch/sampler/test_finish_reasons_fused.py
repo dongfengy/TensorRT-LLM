@@ -11,7 +11,8 @@ from tensorrt_llm.bindings.executor import FinishReason
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("max_tokens,max_beam_width", [(1, 1), (3, 1), (1, 2), (2, 3)])
-def test_fused_matches_tensor_ops(max_tokens: int, max_beam_width: int) -> None:
+@pytest.mark.parametrize("extra_slot", [0, 1])
+def test_fused_matches_tensor_ops(max_tokens: int, max_beam_width: int, extra_slot: int) -> None:
     torch.manual_seed(0)
     max_num_sequences, end_id = 5, 99
     handler = FinishReasonsHandler(
@@ -30,9 +31,14 @@ def test_fused_matches_tensor_ops(max_tokens: int, max_beam_width: int) -> None:
     seq_slots = torch.tensor([3, 0, 4], dtype=torch.int64, device="cuda")
     seq_lens = torch.tensor([7, 13, 15], dtype=torch.int32, device="cuda")
     new_tokens = torch.randint(
-        0, 50, (max_tokens, max_num_sequences, max_beam_width), dtype=torch.int32, device="cuda"
+        0,
+        50,
+        (max_tokens, max_num_sequences + extra_slot, max_beam_width),
+        dtype=torch.int32,
+        device="cuda",
     )
     new_tokens[0, 4, 0] = end_id  # one slot finishes on the end ID, one on max length
+    new_tokens[-1, 3, -1] = end_id  # exercise the padded token stride at later steps
 
     def run() -> torch.Tensor:
         # Seeding with END_ID also shows that untouched slots keep their value.
@@ -54,3 +60,4 @@ def test_fused_matches_tensor_ops(max_tokens: int, max_beam_width: int) -> None:
     torch.testing.assert_close(fused, run(), rtol=0, atol=0)
     assert fused[0, 4, 0].item() == FinishReason.END_ID.value
     assert fused[0, 0, 0].item() == FinishReason.LENGTH.value
+    assert fused[-1, 3, -1].item() == FinishReason.END_ID.value

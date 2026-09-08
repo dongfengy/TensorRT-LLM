@@ -661,11 +661,12 @@ class FinishReasonsHandler:
         assert seq_lens.numel() == seq_slots.numel()
         assert seq_slots.dtype == torch.int64 and seq_lens.dtype in (torch.int32, torch.int64)
         assert new_tokens.is_contiguous()
-        assert new_tokens.shape == (
-            self._max_tokens,
-            self._max_num_sequences,
-            self._max_beam_width,
-        )
+        # TorchSampler reserves an extra slot for CUDA graph padding. Real
+        # requests never index that slot; both kernels use the tensor strides.
+        assert new_tokens.dim() == 3
+        assert new_tokens.size(0) == self._max_tokens
+        assert new_tokens.size(1) in (self._max_num_sequences, self._max_num_sequences + 1)
+        assert new_tokens.size(2) == self._max_beam_width
         return self._fused_tile_fits and seq_slots.numel() > 0
 
     @nvtx_range("_write_finish_reasons")
