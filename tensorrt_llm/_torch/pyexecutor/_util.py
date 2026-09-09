@@ -483,7 +483,10 @@ def _get_num_pool_groups_for_estimation(
     num_layers = getattr(model_config, "num_hidden_layers", None)
     layer_types = getattr(model_config, "layer_types", None)
     attention_windows = None
-    if isinstance(num_layers, int) and num_layers > 0:
+    kv_cache_uses_attention_windows = (fallback_attention_windows is not None
+                                       or is_gemma4_hybrid(model_config))
+    if kv_cache_uses_attention_windows and isinstance(num_layers,
+                                                      int) and num_layers > 0:
         try:
             inferred_windows = [
                 get_layer_attention_window(model_config, layer_idx)
@@ -508,9 +511,15 @@ def _get_num_pool_groups_for_estimation(
         return len(set(normalized_windows))
 
     if isinstance(layer_types, (list, tuple)):
-        num_layer_types = len(set(layer_types))
-        if num_layer_types > 1:
-            return num_layer_types
+        # These tags come from HF pretrained_config.layer_types.
+        # Without windowed KV storage, sliding/full attention share a pool type.
+        pool_types = set()
+        for layer_type in layer_types:
+            if not kv_cache_uses_attention_windows and layer_type == "sliding_attention":
+                layer_type = "full_attention"
+            pool_types.add(layer_type)
+        if len(pool_types) > 1:
+            return len(pool_types)
 
     if fallback_attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
@@ -1787,6 +1796,18 @@ class KvCacheCreator:
         if budget_attr != "max_gpu_total_bytes":
             target_kv = CacheCost(slope=target_kv.slope)
             draft_kv = CacheCost(slope=draft_kv.slope)
+        elif (self._kv_cache_manager_cls is KVCacheManagerV2
+              and (target_kv.intercept or draft_kv.intercept)
+              and self._draft_model_engine is None and
+              not self._speculative_config.spec_dec_mode.is_external_drafter()):
+            # In this ordinary V2 path (excluding external drafters),
+            # a nonzero intercept is full-batch SWA demand, not a fixed minimum.
+            # Use total demand as the relative GPU split weight.
+            workload_tokens = self._max_batch_size * self._max_seq_len
+            target_kv = CacheCost(
+                slope=target_kv.bytes_for_tokens(workload_tokens))
+            draft_kv = CacheCost(
+                slope=draft_kv.bytes_for_tokens(workload_tokens))
 
         shares = self._compute_draft_budget_shares(total_budget, target_kv,
                                                    draft_kv)
@@ -2515,6 +2536,9 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs["max_cuda_graph_batch_size"] = (
+            model_engine._max_cuda_graph_batch_size
+            if model_engine is not None else None)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
