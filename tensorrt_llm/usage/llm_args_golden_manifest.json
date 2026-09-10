@@ -90,9 +90,10 @@
     {
       "allowed_values": [
         "round_robin",
-        "least_queued"
+        "least_queued",
+        "least_tokens"
       ],
-      "annotation": "Literal['round_robin', 'least_queued']",
+      "annotation": "Literal['round_robin', 'least_queued', 'least_tokens']",
       "converter": "",
       "kind": "categorical",
       "path": "attention_dp_config.kv_cache_routing_new_conv_placement"

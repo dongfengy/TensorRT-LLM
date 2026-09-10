@@ -43,7 +43,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_load_balance_weight` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_match_rate_threshold` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
-| `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued']` | `categorical` |  | `round_robin`, `least_queued` |
+| `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued', 'least_tokens']` | `categorical` |  | `round_robin`, `least_queued`, `least_tokens` |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
