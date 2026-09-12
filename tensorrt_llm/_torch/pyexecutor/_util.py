@@ -1050,7 +1050,10 @@ class KvCacheCreator:
                 model.model_config.multimodal_config.encoder_cache_max_bytes)
         return unprofiled_output_bytes + cache_bytes
 
-    def _get_token_num_for_estimation(self) -> int:
+    def _get_token_num_for_estimation(self,
+                                      *,
+                                      include_pool_group_padding: bool = True
+                                      ) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
         if 'cp_type' in self._mapping.cp_config:
             raise ValueError(
@@ -1097,13 +1100,20 @@ class KvCacheCreator:
         # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
         num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
 
+        if not include_pool_group_padding:
+            # Prefill warmup may split its tokens across max_batch_size requests.
+            num_cache_blocks = max(
+                num_cache_blocks,
+                ceil_div(self._max_num_tokens, self._tokens_per_block) +
+                self._max_batch_size)
+
         # KVCacheManagerV2 divides the quota derived from max_tokens across its
         # pool groups. Scale the dummy workload by the inferred group count so
         # each pool can hold a max-length request. This covers both VSWA pools
         # (distinct attention windows) and hybrid recurrent/attention pools
         # (distinct layer types without sliding windows).
         num_pool_groups = 1
-        if self._is_kv_cache_manager_v2:
+        if self._is_kv_cache_manager_v2 and include_pool_group_padding:
             model_cfg = self._model_engine.model.model_config.pretrained_config
             num_pool_groups = _get_num_pool_groups_for_estimation(
                 model_cfg,
@@ -1513,6 +1523,11 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            estimation_token_count=(self._get_token_num_for_estimation(
+                include_pool_group_padding=False) if estimating_kv_cache
+                                    and kv_cache_manager_cls is KVCacheManagerV2
+                                    and mapping.world_size == 1 and
+                                    self._speculative_config is None else None),
         )
 
         if not self._skip_est:
@@ -2428,7 +2443,8 @@ def _create_kv_cache_manager(
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
-        max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
+        max_cuda_graph_batch_size: Optional[int] = None,
+        estimation_token_count: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2579,6 +2595,7 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs["estimation_token_count"] = estimation_token_count
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
             model_engine._max_cuda_graph_batch_size
             if model_engine is not None else max_cuda_graph_batch_size)

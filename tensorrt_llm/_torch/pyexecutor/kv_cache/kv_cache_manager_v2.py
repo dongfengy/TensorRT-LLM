@@ -973,6 +973,7 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
+        estimation_token_count: Optional[int] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1417,6 +1418,23 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
         assert candidate is not None
+        if (
+            self.is_estimating_kv_cache
+            and estimation_token_count is not None
+            and len(candidate.pool_group_descs) == 1
+        ):
+            # With one physical pool, retaining every warmup token in every
+            # layer bounds profiling demand. Resize the still-empty cache;
+            # native resize rejects quotas below the page-table/warmup floor.
+            estimation_quota = math.ceil(
+                estimation_token_count * self.get_cache_bytes_per_token() / max_util_for_resume
+            )
+            if estimation_quota < candidate.get_quota(0) and candidate.resize(0, estimation_quota):
+                logger.info(
+                    f"Estimation KV cache GPU quota reduced to "
+                    f"{candidate.get_quota(0) / (1 << 30)}GiB"
+                )
+
         self.kv_cache_manager_py_config = config
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
