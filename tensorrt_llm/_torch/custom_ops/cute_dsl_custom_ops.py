@@ -16829,7 +16829,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_dtype: torch.dtype,
             scaling_vector_size: int = 16,
             precomputed_tactic: Optional[str] = None,
+            expert_counts: Optional[torch.Tensor] = None,
+            expert_capacity: int = 0,
         ) -> None:
+            # The shared FC2 dispatch passes the count-native expert metadata
+            # keywords to both the Blackwell and the Rubin finalize ops; the
+            # Rubin kernel has no count-native variant, so accept the keywords
+            # and reject only a non-empty request.
+            if expert_counts is None and expert_capacity != 0:
+                raise ValueError(
+                    "expert_capacity must be zero when expert_counts is absent")
+            if expert_counts is not None:
+                raise NotImplementedError(
+                    "count-native expert metadata (expert_counts) is not "
+                    "supported by the Rubin grouped GEMM finalize kernel")
             tuner = AutoTuner.get()
 
             runner = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
@@ -16928,6 +16941,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_dtype: torch.dtype,
             scaling_vector_size: int = 16,
             precomputed_tactic: Optional[str] = None,
+            expert_counts: Optional[torch.Tensor] = None,
+            expert_capacity: int = 0,
         ) -> None:
             return
 
