@@ -40,11 +40,14 @@
 // exactly one CTA tile, so its tile index is its rank among the selected local experts and its rows start at
 // rank * tile, which is what the small-token kernel's scans compute.
 
-#include "RoutingCustomPolicy.cuh"
-#include "RoutingKernel.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/glmMoeDsa/glmMoeFusedRouter.h"
+#include "tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingCustomPolicy.cuh"
+#include "tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingKernel.h"
 
 #include <cooperative_groups.h>
 
+// The kernel is file-local to the routing namespace whose policies and helpers it uses.
 namespace moe::dev::routing
 {
 namespace routingCustom
@@ -75,7 +78,8 @@ constexpr int kKIdxRowBytes = 8;
 constexpr uint32_t kNegZeroBits = 0x80000000u;
 
 static_assert(kNumExperts == kNumThreads, "the routing CTA runs one thread per expert");
-static_assert(2 * kExchangeFloats + 4 == FusedRouterWorkspaceWords, "workspace layout");
+static_assert(
+    2 * kExchangeFloats + 4 == tensorrt_llm::kernels::glm_moe_dsa::kFusedRouterWorkspaceWords, "workspace layout");
 
 struct FusedRouterParams
 {
@@ -474,8 +478,6 @@ void launchFusedRouter(FusedRouterParams const& params, bool usePdl, cudaStream_
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, routingFusedRouterKernel<kNumTokens>, params));
 }
 
-} // namespace
-
 bool supportsFusedRouter(Data const& data, int32_t hiddenDim)
 {
     return hiddenDim == kHiddenDim && data.mNumExperts == kNumExperts && data.mTopK == kTopK && data.mNumTokens >= 1
@@ -512,5 +514,61 @@ void runFusedRouter(Data const& data, void const* hiddenStates, void const* rout
     }
 }
 
+} // namespace
 } // namespace routingCustom
 } // namespace moe::dev::routing
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::glm_moe_dsa
+{
+
+void invokeFusedRouter(void const* routerHiddenStates, void const* routerWeight, int32_t hiddenDim,
+    int32_t* routerWorkspace, void* routingBias, batchedGemm::trtllm::gen::Dtype dtypeRoutingBias, int32_t numTokens,
+    int32_t numExperts, int32_t topK, int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
+    int32_t tileTokensDim, int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToTokenIdx,
+    void* expertWeights, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
+    cudaStream_t stream)
+{
+    int32_t paddingLog2 = 0;
+    while ((1 << paddingLog2) < tileTokensDim)
+    {
+        ++paddingLog2;
+    }
+    TLLM_CHECK_WITH_INFO(
+        (1 << paddingLog2) == tileTokensDim, "tileTokensDim must be a power of 2, got %d", tileTokensDim);
+
+    // The routing configuration of the TRTLLM-Gen MoE runner's DeepSeek-V3 routing without groups.
+    ::moe::dev::routing::routingCustom::Data routingData;
+    routingData.mDtypeOutput = batchedGemm::trtllm::gen::Dtype::Bfloat16;
+    routingData.mDtypeInput = batchedGemm::trtllm::gen::Dtype::Fp32;
+    routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+    routingData.mPreprocessType = ::moe::dev::routing::RoutingPreprocessType::SigmoidBias;
+    routingData.mPostprocessType = ::moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
+    routingData.mPtrRoutingBias = routingBias;
+    routingData.mDtypeBias = dtypeRoutingBias;
+    routingData.mRouteScale = routedScalingFactor;
+    routingData.mPtrPermutedIdxSize = permutedIdxSize;
+    routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+    routingData.mPtrPermutedIdxToExpandedIdx = nullptr;
+    routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+    routingData.mPtrTopKWeights = expertWeights;
+    routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+    routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+    routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+    routingData.mNumTokens = numTokens;
+    routingData.mNumExperts = numExperts;
+    routingData.mTopK = topK;
+    routingData.mPaddingLog2 = paddingLog2;
+    routingData.mTileTokensDim = tileTokensDim;
+    routingData.mLocalExpertsStartIdx = localExpertOffset;
+    routingData.mLocalExpertsStrideLog2 = 0;
+    routingData.mNumLocalExperts = localNumExperts;
+
+    ::moe::dev::routing::routingCustom::runFusedRouter(
+        routingData, routerHiddenStates, routerWeight, hiddenDim, routerWorkspace, stream);
+}
+
+} // namespace kernels::glm_moe_dsa
+
+TRTLLM_NAMESPACE_END

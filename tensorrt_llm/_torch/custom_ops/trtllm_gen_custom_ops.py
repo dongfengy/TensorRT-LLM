@@ -461,8 +461,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False,
-                 prefer_gemm2_k128: bool = False):
+                 use_dp: bool = False):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -475,7 +474,6 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
         self.act_type = act_type
-        self.prefer_gemm2_k128 = prefer_gemm2_k128
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
@@ -485,10 +483,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
     def unique_id(self):
-        key = (self.top_k, self.intermediate_size, self.local_num_experts,
-               self.act_type)
-        # FC2 on gemm2K128 times the tile-8 tactics differently.
-        return key + ("gemm2_k128", ) if self.prefer_gemm2_k128 else key
+        return (self.top_k, self.intermediate_size, self.local_num_experts,
+                self.act_type)
 
     def get_runner(self):
         instance_key = (self.act_type, )
@@ -503,10 +499,6 @@ class FP4BlockScaleMoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
         output: Optional[torch.Tensor] = None,
-        hidden_states_ready_event: Optional[int] = None,
-        router_hidden_states: Optional[torch.Tensor] = None,
-        router_weight: Optional[torch.Tensor] = None,
-        router_workspace: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -524,9 +516,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output,
-            hidden_states_ready_event, router_hidden_states, router_weight,
-            router_workspace, self.prefer_gemm2_k128)
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -658,61 +648,38 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
-def fp4_block_scale_moe_runner(
-        routing_logits: Optional[torch.Tensor],
-        routing_bias: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        hidden_states_scale: torch.Tensor,
-        gemm1_weights: torch.Tensor,
-        gemm1_weights_scale: torch.Tensor,
-        gemm1_bias: torch.Tensor,
-        gemm1_alpha: torch.Tensor,
-        gemm1_beta: torch.Tensor,
-        gemm1_clamp_limit: torch.Tensor,
-        gemm2_weights: torch.Tensor,
-        gemm2_weights_scale: torch.Tensor,
-        gemm2_bias: torch.Tensor,
-        output1_scale_scalar: torch.Tensor,
-        output1_scale_gate_scalar: torch.Tensor,
-        output2_scale_scalar: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        n_group: Optional[int],
-        topk_group: Optional[int],
-        intermediate_size: int,
-        local_expert_offset: int,
-        local_num_experts: int,
-        routed_scaling_factor: Optional[float],
-        routing_method_type: int,
-        do_finalize: bool,
-        act_type: int = ActType_TrtllmGen.SwiGlu.value,
-        topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
-        tune_max_num_tokens: int = 8192,
-        use_dp: bool = False,
-        hidden_states_ready_event: Optional[int] = None,
-        router_hidden_states: Optional[torch.Tensor] = None,
-        router_weight: Optional[torch.Tensor] = None,
-        router_workspace: Optional[torch.Tensor] = None,
-        prefer_gemm2_k128: bool = False) -> List[torch.Tensor]:
-    """hidden_states_ready_event: raw cudaEvent_t (torch.cuda.Event.cuda_event)
-    recorded on another stream once hidden_states and hidden_states_scale are
-    written; the op waits on it right before FC1, after launching routing.
-
-    router_hidden_states, router_weight, router_workspace: the router GEMV runs
-    in the routing kernel (DeepSeekV3 routing without groups, 256 experts,
-    top-8, hidden 6144, 1-8 tokens): the logits of
-    dsv3_router_gemm_op(router_hidden_states, router_weight.t()) are computed
-    there and routing_logits only gives their shape (it is not read or
-    written). router_workspace: int32 [FUSED_ROUTER_WORKSPACE_WORDS], see
-    make_fused_router_workspace; the kernel uses and restores it. Profiling
-    runs of the autotuner route from routing_logits as usual.
-
-    prefer_gemm2_k128: FC2 runs on the persistent K = 128 kernel where it
-    covers the shape (NVFP4, tile N 8, intermediate size 128, no bias, enough
-    SMs), with the output rows of the Gemm2 cubin, bitwise; elsewhere the cubin
-    runs."""
+def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
+                               routing_bias: Optional[torch.Tensor],
+                               hidden_states: torch.Tensor,
+                               hidden_states_scale: torch.Tensor,
+                               gemm1_weights: torch.Tensor,
+                               gemm1_weights_scale: torch.Tensor,
+                               gemm1_bias: torch.Tensor,
+                               gemm1_alpha: torch.Tensor,
+                               gemm1_beta: torch.Tensor,
+                               gemm1_clamp_limit: torch.Tensor,
+                               gemm2_weights: torch.Tensor,
+                               gemm2_weights_scale: torch.Tensor,
+                               gemm2_bias: torch.Tensor,
+                               output1_scale_scalar: torch.Tensor,
+                               output1_scale_gate_scalar: torch.Tensor,
+                               output2_scale_scalar: torch.Tensor,
+                               num_experts: int,
+                               top_k: int,
+                               n_group: Optional[int],
+                               topk_group: Optional[int],
+                               intermediate_size: int,
+                               local_expert_offset: int,
+                               local_num_experts: int,
+                               routed_scaling_factor: Optional[float],
+                               routing_method_type: int,
+                               do_finalize: bool,
+                               act_type: int = ActType_TrtllmGen.SwiGlu.value,
+                               topk_weights: Optional[torch.Tensor] = None,
+                               topk_ids: Optional[torch.Tensor] = None,
+                               output: Optional[torch.Tensor] = None,
+                               tune_max_num_tokens: int = 8192,
+                               use_dp: bool = False) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -729,7 +696,6 @@ def fp4_block_scale_moe_runner(
         act_type,
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
-        prefer_gemm2_k128=prefer_gemm2_k128,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -789,11 +755,7 @@ def fp4_block_scale_moe_runner(
     result = kernel_runner(
         input_tensors,
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-        output=output,
-        hidden_states_ready_event=hidden_states_ready_event,
-        router_hidden_states=router_hidden_states,
-        router_weight=router_weight,
-        router_workspace=router_workspace)
+        output=output)
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
@@ -801,24 +763,6 @@ def fp4_block_scale_moe_runner(
     if output is not None and do_finalize:
         return [torch.empty(0, device=output.device, dtype=output.dtype)]
     return result
-
-
-# routingCustom::FusedRouterWorkspaceWords: two exchange buffers of
-# [8 tokens][256 experts][4 slices] fp32, then the epoch word, padded to 16 B.
-FUSED_ROUTER_WORKSPACE_WORDS = 2 * 8 * 256 * 4 + 4
-
-
-def make_fused_router_workspace(device: torch.device) -> torch.Tensor:
-    """Workspace of fp4_block_scale_moe_runner's fused router GEMV + routing
-    kernel (router_workspace): both exchange buffers idle (-0.0, bits
-    0x80000000) and epoch 0. Between launches the buffer the next launch uses
-    is idle; nothing else may write the workspace. Launches that share a
-    workspace must run in stream order."""
-    workspace = torch.zeros(FUSED_ROUTER_WORKSPACE_WORDS,
-                            dtype=torch.int32,
-                            device=device)
-    workspace[:FUSED_ROUTER_WORKSPACE_WORDS - 4].fill_(-2**31)
-    return workspace
 
 
 def fp4_block_scale_fake_output_without_finalize(
@@ -879,12 +823,7 @@ def _(routing_logits,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
-      use_dp: bool = False,
-      hidden_states_ready_event: Optional[int] = None,
-      router_hidden_states: Optional[torch.Tensor] = None,
-      router_weight: Optional[torch.Tensor] = None,
-      router_workspace: Optional[torch.Tensor] = None,
-      prefer_gemm2_k128: bool = False) -> List[torch.Tensor]:
+      use_dp: bool = False) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

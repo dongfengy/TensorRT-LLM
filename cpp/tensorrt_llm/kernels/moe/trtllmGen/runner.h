@@ -193,17 +193,6 @@ public:
         batchedGemm::trtllm::gen::Dtype dtypeRoutingLogits = batchedGemm::trtllm::gen::Dtype::Bfloat16,
         batchedGemm::trtllm::gen::Dtype dtypeRoutingBias = batchedGemm::trtllm::gen::Dtype::Bfloat16);
 
-    // run() for DeepSeekV3 routing without groups or fused shared experts, with the router GEMV in the same kernel:
-    // the routing logits are computed from routerHiddenStates [numTokens, hiddenDim] and routerWeight [numExperts,
-    // hiddenDim] (bf16) as dsv3_router_gemm_op computes them (see routingCustom::runFusedRouter, which checks that the
-    // shape is covered).
-    void runFusedRouter(void const* routerHiddenStates, void const* routerWeight, int32_t hiddenDim,
-        int32_t* routerWorkspace, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-        int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor, int32_t* permutedIdxSize,
-        int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
-        void* expertWeights, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-        cudaStream_t stream, batchedGemm::trtllm::gen::Dtype dtypeRoutingBias);
-
 private:
     int32_t mTileTokensDim;
 };
@@ -299,9 +288,6 @@ struct MoERunnerArgs
     // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
     // and [num_tokens, hidden_size/16] in float for e2m1
     void* hidden_states_scale = nullptr;
-    // Optional: recorded on another stream once hidden_states and hidden_states_scale are written. The runner waits
-    // on it right before gemm1, their first reader, so the routing launched before gemm1 does not wait for them.
-    cudaEvent_t hidden_states_ready = nullptr;
 
     // Optional inputs:
     void* topk_weights = nullptr; // [num_tokens, top_k]  with quantized weights
@@ -366,10 +352,6 @@ struct MoERunnerArgs
 
     // finalize
     bool do_finalize{true};
-
-    // Run gemm2 on moe::dev::gemm2K128 instead of the Gemm2 cubin where it covers the shape (see Runner::run); the
-    // output rows are the cubin's, bitwise.
-    bool prefer_gemm2_k128{false};
 };
 
 struct MoEWorkspace
@@ -459,11 +441,6 @@ private:
     // Kept so setOpsData can tell the activation launcher how much per-expert
     // tile padding the permuted row space carries.
     int32_t mTileTokensDim;
-    // Kept to tell whether gemm2K128 covers this runner's Gemm2 (see run()).
-    batchedGemm::trtllm::gen::Dtype mDtypeAct;
-    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
-    bool mUseDeepSeekFp8;
-    bool mUseFineGrained;
 
     // This will be the cartesian product of the passing configs for gemm1 and gemm2
     // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2 separately

@@ -46,11 +46,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-    torch::optional<torch::Tensor> const& out_tensor = torch::nullopt,
-    std::optional<int64_t> const hidden_states_ready_event = std::nullopt,
-    torch::optional<torch::Tensor> const& router_hidden_states = torch::nullopt,
-    torch::optional<torch::Tensor> const& router_weight = torch::nullopt,
-    torch::optional<torch::Tensor> const& router_workspace = torch::nullopt, bool const prefer_gemm2_k128 = false)
+    torch::optional<torch::Tensor> const& out_tensor = torch::nullopt)
 {
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
@@ -158,10 +154,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
     args.hidden_states = hidden_states.data_ptr();
     args.hidden_states_scale = hidden_states_scale.has_value() ? hidden_states_scale.value().data_ptr() : nullptr;
-    // Raw cudaEvent_t (torch.cuda.Event.cuda_event) recorded where hidden_states are written; gemm1 waits on it.
-    args.hidden_states_ready = hidden_states_ready_event.has_value()
-        ? reinterpret_cast<cudaEvent_t>(static_cast<intptr_t>(hidden_states_ready_event.value()))
-        : nullptr;
 
     args.topk_weights = topk_weights.has_value() ? topk_weights.value().data_ptr() : nullptr;
     args.topk_ids = topk_ids.has_value() ? static_cast<int32_t*>(topk_ids.value().data_ptr()) : nullptr;
@@ -294,50 +286,16 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     auto const dtypeRoutingLogits = routing_logits.has_value()
         ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
         : btg::Dtype::Bfloat16;
-    if (router_hidden_states.has_value())
-    {
-        // The router GEMV runs in the routing kernel: routing_logits only gives the shape and is not read or written.
-        TORCH_CHECK(router_weight.has_value() && router_workspace.has_value(),
-            "router_hidden_states needs router_weight and router_workspace.");
-        TORCH_CHECK(!args.topk_ids
-                && static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3
-                && args.n_group <= 1 && routing_bias.has_value(),
-            "The fused router covers DeepSeekV3 routing without groups, with a routing bias, from the router inputs.");
-        auto const& hs = router_hidden_states.value();
-        auto const& rw = router_weight.value();
-        auto const& ws = router_workspace.value();
-        TORCH_CHECK(hs.scalar_type() == at::ScalarType::BFloat16 && hs.dim() == 2 && hs.is_contiguous()
-                && hs.sizes()[0] == args.num_tokens && hs.sizes()[1] == args.hidden_size
-                && hs.device() == routing_device,
-            "router_hidden_states must be a contiguous bf16 [num_tokens, hidden_size] tensor on the routing device.");
-        TORCH_CHECK(rw.scalar_type() == at::ScalarType::BFloat16 && rw.dim() == 2 && rw.is_contiguous()
-                && rw.sizes()[0] == num_experts && rw.sizes()[1] == hs.sizes()[1] && rw.device() == routing_device,
-            "router_weight must be a contiguous bf16 [num_experts, hidden] tensor on the routing device.");
-        TORCH_CHECK(ws.scalar_type() == at::ScalarType::Int && ws.is_contiguous()
-                && ws.numel() == moe::dev::routing::routingCustom::FusedRouterWorkspaceWords
-                && ws.device() == routing_device,
-            "router_workspace must be a contiguous int32 tensor of ",
-            moe::dev::routing::routingCustom::FusedRouterWorkspaceWords, " words on the routing device.");
-        routing_runner.runFusedRouter(hs.data_ptr(), rw.data_ptr(), static_cast<int32_t>(hs.sizes()[1]),
-            ws.data_ptr<int>(), args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-            args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
-            total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr,
-            permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, cta_idx_xy_to_batch_idx.data_ptr<int>(),
-            cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), stream, args.mDtypeBias);
-    }
-    else
-    {
-        routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-            /* num_fused_shared_expert */ 0, args.n_group, args.topk_group, args.local_expert_offset,
-            args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
-            expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
-            expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
-            permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
-            num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
-            cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
-            false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
-            static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
-    }
+    routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
+        /* num_fused_shared_expert */ 0, args.n_group, args.topk_group, args.local_expert_offset,
+        args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
+        expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
+        expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
+        permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
+        num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
+        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
+        false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
+        static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
 
     //
     // FC13 (gemm1) + FC2 (gemm2)
@@ -528,7 +486,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.output1_scales_gate_scalar = output1_scales_gate_scalar.data_ptr<float>();
     args.output2_scales_scalar = output2_scales_scalar.data_ptr<float>();
     args.do_finalize = do_finalize;
-    args.prefer_gemm2_k128 = prefer_gemm2_k128;
 
     auto const workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
 
@@ -632,11 +589,7 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt,
-        std::optional<int64_t> const hidden_states_ready_event = std::nullopt,
-        torch::optional<torch::Tensor> const& router_hidden_states = torch::nullopt,
-        torch::optional<torch::Tensor> const& router_weight = torch::nullopt,
-        torch::optional<torch::Tensor> const& router_workspace = torch::nullopt, bool const prefer_gemm2_k128 = false)
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
     {
         int64_t tileN = moeConfigIndex[0];
         int64_t config = moeConfigIndex[1];
@@ -686,8 +639,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *runner, configToRun,
-            topk_weights, topk_ids, output, hidden_states_ready_event, router_hidden_states, router_weight,
-            router_workspace, prefer_gemm2_k128);
+            topk_weights, topk_ids, output);
     }
 
 private:

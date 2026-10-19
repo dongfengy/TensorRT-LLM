@@ -18,10 +18,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
-namespace moe::dev::gemm2K128
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::glm_moe_dsa::gemm2K128
 {
 
 // FC2 of the NVFP4 MoE at intermediate size 128 and tile N 8, with the inputs and output of the TRTLLM-Gen Gemm2
@@ -57,4 +61,6 @@ bool isSupported(int32_t hiddenSize, int32_t maxNumCtas);
 
 void run(Data const& data, cudaStream_t stream);
 
-} // namespace moe::dev::gemm2K128
+} // namespace kernels::glm_moe_dsa::gemm2K128
+
+TRTLLM_NAMESPACE_END

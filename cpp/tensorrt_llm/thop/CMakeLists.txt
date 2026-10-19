@@ -128,7 +128,8 @@ add_th_common_family(
   noAuxTcOp.cpp
   dsv3RouterGemmOp.cpp
   glmRouterGemmOp.cpp
-  glmLowMBf16MoeOp.cpp)
+  glmLowMBf16MoeOp.cpp
+  glmRoutedExpertsOp.cpp)
 
 # MoE torch ops live in moe/<backend|role>/; that directory adds them to
 # th_common_moe with target_sources() so the list stays next to the files.

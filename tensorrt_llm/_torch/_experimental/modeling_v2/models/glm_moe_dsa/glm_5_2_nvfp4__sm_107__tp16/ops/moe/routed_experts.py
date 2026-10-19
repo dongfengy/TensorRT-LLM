@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2's routed experts at MoE TP16: DeepSeek-V3 routing without groups
 (sigmoid + bias, top-8 of 256, scaled sum normalization), grouped NVFP4 FC1 +
-SwiGLU + NVFP4 requantization + grouped NVFP4 FC2, in one trtllm-gen call.
+SwiGLU + NVFP4 requantization + grouped NVFP4 FC2, in one call of
+`trtllm::glm_routed_experts`: the TRTLLM-Gen MoE kernels with GLM's own router
+and FC2 kernels beside them.
 
 On the decode step (up to 8 rows) the call runs the router GEMV inside the
 routing kernel, lets the NVFP4 input still be in flight on another stream
@@ -11,7 +13,7 @@ finalize step, which the post-MoE all-reduce hop performs."""
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -26,9 +28,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_m
     dequantize_nvfp4,
     quantize_nvfp4,
 )
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
-    FUSED_ROUTER_WORKSPACE_WORDS,
-    make_fused_router_workspace,
+    FP4BlockScaleMoEInputs,
+    FP4BlockScaleMoERunner,
+    fp4_block_scale_fake_output_without_finalize,
+    prepare_dummy_topk_and_hook,
 )
 
 __all__ = [
@@ -55,6 +60,296 @@ FUSED_ROUTER_MAX_TOKENS = 8
 Operand = Tuple[torch.Tensor, torch.Tensor]
 
 _IDLE_BITS = -(2**31)  # -0.0f, the idle value of a fused-router exchange buffer
+
+#: Words of a fused-router workspace (`router_workspace`): two exchange
+#: buffers of [8 tokens][256 experts][4 slices] fp32, then the epoch word,
+#: padded to 16 bytes (kFusedRouterWorkspaceWords, glmMoeFusedRouter.h).
+FUSED_ROUTER_WORKSPACE_WORDS = 2 * 8 * 256 * 4 + 4
+
+
+def make_fused_router_workspace(device: torch.device) -> torch.Tensor:
+    """A fused-router workspace in its between-launch state: both exchange
+    buffers idle (-0.0, bits 0x80000000) and epoch 0. Only the op writes it,
+    and launches that share it must run in stream order."""
+    workspace = torch.zeros(FUSED_ROUTER_WORKSPACE_WORDS, dtype=torch.int32, device=device)
+    workspace[: FUSED_ROUTER_WORKSPACE_WORDS - 4].fill_(_IDLE_BITS)
+    return workspace
+
+
+class _RoutedExpertsTunableRunner(FP4BlockScaleMoERunner):
+    """The autotuner's runner for `trtllm::glm_routed_experts`: the tactics
+    (tile N, FC1 / FC2 config pair) and tuning buckets of the TRTLLM-Gen FP4
+    MoE runner, run on `torch.classes.trtllm.GlmRoutedExpertsRunner`."""
+
+    runner_dict = dict()
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        do_finalize: bool,
+        act_type: int,
+        tune_max_num_tokens: int,
+        use_dp: bool,
+        prefer_gemm2_k128: bool,
+    ):
+        super().__init__(
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            do_finalize,
+            act_type,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_dp=use_dp,
+        )
+        self.prefer_gemm2_k128 = prefer_gemm2_k128
+
+    def unique_id(self):
+        # FC2 on the K = 128 kernel times the tile-8 tactics differently.
+        key = super().unique_id()
+        return key + ("gemm2_k128",) if self.prefer_gemm2_k128 else key
+
+    def get_runner(self):
+        key = (self.act_type,)
+        if key not in _RoutedExpertsTunableRunner.runner_dict:
+            _RoutedExpertsTunableRunner.runner_dict[key] = (
+                torch.classes.trtllm.GlmRoutedExpertsRunner(self.act_type)
+            )
+        return _RoutedExpertsTunableRunner.runner_dict[key]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Optional[List[int]] = None,
+        output: Optional[torch.Tensor] = None,
+        hidden_states_ready_event: Optional[int] = None,
+        router_hidden_states: Optional[torch.Tensor] = None,
+        router_weight: Optional[torch.Tensor] = None,
+        router_workspace: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        args = FP4BlockScaleMoEInputs(*inputs)
+        return self.get_runner().run_moe(
+            args.routing_logits,
+            args.routing_bias,
+            args.hidden_states,
+            args.hidden_states_scale,
+            args.gemm1_weights,
+            args.gemm1_weights_scale,
+            args.gemm1_bias,
+            args.gemm1_alpha,
+            args.gemm1_beta,
+            args.gemm1_clamp_limit,
+            args.gemm2_weights,
+            args.gemm2_weights_scale,
+            args.gemm2_bias,
+            args.output1_scale_scalar,
+            args.output1_scale_gate_scalar,
+            args.output2_scale_scalar,
+            self.num_experts,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.intermediate_size,
+            self.local_expert_offset,
+            self.local_num_experts,
+            self.routed_scaling_factor,
+            self.routing_method_type,
+            self.do_finalize,
+            [-1, -1] if tactic is None else tactic,
+            args.topk_weights,
+            args.topk_ids,
+            output,
+            hidden_states_ready_event,
+            router_hidden_states,
+            router_weight,
+            router_workspace,
+            self.prefer_gemm2_k128,
+        )
+
+
+@torch.library.custom_op("trtllm::glm_routed_experts", mutates_args=())
+def _glm_routed_experts(
+    routing_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: Optional[torch.Tensor],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: Optional[torch.Tensor],
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    do_finalize: bool,
+    act_type: int,
+    topk_weights: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    tune_max_num_tokens: int,
+    use_dp: bool,
+    hidden_states_ready_event: Optional[int],
+    router_hidden_states: Optional[torch.Tensor],
+    router_weight: Optional[torch.Tensor],
+    router_workspace: Optional[torch.Tensor],
+    prefer_gemm2_k128: bool,
+) -> List[torch.Tensor]:
+    """The op behind `GlmRoutedExperts.__call__` (see there). The autotuner
+    profiles it routed from logits, as it profiles the TRTLLM-Gen FP4 MoE op."""
+    tuner = AutoTuner.get()
+    kernel_runner = _RoutedExpertsTunableRunner(
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        do_finalize,
+        act_type,
+        tune_max_num_tokens,
+        use_dp,
+        prefer_gemm2_k128,
+    )
+    routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config = (
+        prepare_dummy_topk_and_hook(
+            routing_method_type=routing_method_type,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            hidden_states=hidden_states,
+            routing_logits=routing_logits,
+            base_tuning_config=kernel_runner.tuning_config,
+            top_k=top_k,
+            num_experts=num_experts,
+            local_num_experts=local_num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            hidden_states_index=2,
+            local_expert_offset=local_expert_offset,
+            use_dp=use_dp,
+        )
+    )
+    input_tensors = [
+        routing_logits_for_tuner,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm2_bias,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        topk_weights_for_tuner,
+        topk_ids_for_tuner,
+    ]
+    kernel_runner, best_tactic = tuner.choose_one(
+        "trtllm::glm_routed_experts", [kernel_runner], tuning_config, input_tensors
+    )
+    # The call itself runs on the caller's routing inputs, not the tuner's.
+    input_tensors[0] = routing_logits
+    input_tensors[-2] = topk_weights
+    input_tensors[-1] = topk_ids
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output,
+        hidden_states_ready_event=hidden_states_ready_event,
+        router_hidden_states=router_hidden_states,
+        router_weight=router_weight,
+        router_workspace=router_workspace,
+    )
+    # A finalized call into `output` writes it in place; returning it would
+    # alias an input.
+    if output is not None and do_finalize:
+        return [torch.empty(0, device=output.device, dtype=output.dtype)]
+    return result
+
+
+@_glm_routed_experts.register_fake
+def _(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm1_alpha,
+    gemm1_beta,
+    gemm1_clamp_limit,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    output1_scale_scalar,
+    output1_scale_gate_scalar,
+    output2_scale_scalar,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor,
+    routing_method_type,
+    do_finalize,
+    act_type,
+    topk_weights,
+    topk_ids,
+    output,
+    tune_max_num_tokens,
+    use_dp,
+    hidden_states_ready_event,
+    router_hidden_states,
+    router_weight,
+    router_workspace,
+    prefer_gemm2_k128,
+) -> List[torch.Tensor]:
+    if do_finalize:
+        return [
+            hidden_states.new_empty(
+                (hidden_states.shape[0], hidden_states.shape[1] * 2), dtype=torch.bfloat16
+            )
+        ]
+    return fp4_block_scale_fake_output_without_finalize(
+        hidden_states, num_experts, top_k, routing_bias
+    )
 
 
 def _dequantize_activation(hidden_states: torch.Tensor, hidden_states_scale: torch.Tensor):
@@ -189,7 +484,7 @@ class GlmRoutedExperts(OpWrapper):
         router_workspace: Optional[torch.Tensor],
         prefer_gemm2_k128: bool,
     ) -> list[torch.Tensor]:
-        return torch.ops.trtllm.fp4_block_scale_moe_runner(
+        return torch.ops.trtllm.glm_routed_experts(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -217,16 +512,16 @@ class GlmRoutedExperts(OpWrapper):
             routing_method_type,
             do_finalize,
             act_type,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            output=output,
-            tune_max_num_tokens=tune_max_num_tokens,
-            use_dp=use_dp,
-            hidden_states_ready_event=hidden_states_ready_event,
-            router_hidden_states=router_hidden_states,
-            router_weight=router_weight,
-            router_workspace=router_workspace,
-            prefer_gemm2_k128=prefer_gemm2_k128,
+            topk_weights,
+            topk_ids,
+            output,
+            tune_max_num_tokens,
+            use_dp,
+            hidden_states_ready_event,
+            router_hidden_states,
+            router_weight,
+            router_workspace,
+            prefer_gemm2_k128,
         )
 
     def reference(

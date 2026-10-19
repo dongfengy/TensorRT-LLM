@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-// FC2 of the NVFP4 MoE at intermediate size 128 (K = 128) and tile N 8 (see Gemm2K128.h for the contract).
+// FC2 of the NVFP4 MoE at intermediate size 128 (K = 128) and tile N 8 (see glmMoeGemm2K128.h for the contract).
 //
 // Work. A unit is (token tile t, 128-row tile of the output features); the units are split evenly over a persistent
 // grid of one CTA per SM, each CTA owning a contiguous run of units (one or two token tiles). A CTA holds every unit of
@@ -38,7 +38,7 @@
 // Warps: 0-3 epilogue (TMEM lanes 32 w .. 32 w + 31 = weight rows of each tile), 4 weight loads, 5 TMEM allocation,
 // activations and MMA, 6 weight-scale copies.
 
-#include "Gemm2K128.h"
+#include "tensorrt_llm/kernels/glmMoeDsa/glmMoeGemm2K128.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
@@ -47,7 +47,9 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 
-namespace moe::dev::gemm2K128
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::glm_moe_dsa::gemm2K128
 {
 namespace
 {
@@ -663,4 +665,6 @@ void run(Data const& data, cudaStream_t stream)
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, gemm2K128Kernel, p));
 }
 
-} // namespace moe::dev::gemm2K128
+} // namespace kernels::glm_moe_dsa::gemm2K128
+
+TRTLLM_NAMESPACE_END
