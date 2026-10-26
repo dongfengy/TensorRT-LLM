@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,7 @@ from .. import LLM as PyTorchLLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import GuidedDecodingParams, SamplingParams
-from .interface import Evaluator
+from .interface import Evaluator, get_model_context
 
 
 class JsonModeEval(Evaluator):
@@ -54,6 +54,16 @@ class JsonModeEval(Evaluator):
             self.num_samples = self.data.num_rows
         else:
             self.num_samples = min(num_samples, self.data.num_rows)
+
+    def do_apply_chat_template(self, llm: PyTorchLLM,
+                               prompt: str | list[dict]) -> str:
+        prompt = super().do_apply_chat_template(llm, prompt)
+        if prompt.endswith("<|start|>assistant"):
+            _, model_type = get_model_context(llm)
+            if model_type == "gpt_oss":
+                # Complete the Harmony header before applying JSON constraints.
+                prompt += "<|channel|>final<|message|>"
+        return prompt
 
     def generate_samples(self) -> Iterable[tuple]:
         for i, sample in enumerate(self.data):
