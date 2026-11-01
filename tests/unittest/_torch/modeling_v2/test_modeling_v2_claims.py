@@ -427,7 +427,7 @@ def test_every_target_has_the_accuracy_gate_of_its_name():
 # `unittest/`, with what they wait for. They are the only tests no list may
 # reach, and none of them may be listed.
 _NO_CI_STAGE = {
-    "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/comm": (
+    "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
 }
