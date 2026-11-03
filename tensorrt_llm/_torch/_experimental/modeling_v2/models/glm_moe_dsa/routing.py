@@ -86,6 +86,28 @@ def route(
         # fmt: on
         return ModelingV2Glm52Nvfp4Sm107Tp16
 
+    dep16 = (
+        mapping.world_size == mapping.tp_size == mapping.moe_ep_size == 16
+        and mapping.moe_tp_size == 1
+        and mapping.enable_attention_dp
+        and mapping.pp_size == mapping.cp_size == 1
+    )
+    if (
+        compute_capability == (10, 7)
+        and shape == _SHAPE
+        and index_n_heads == 32
+        and dep16
+        and mtp_eagle_or_none
+        and kv_cache_quant_algo == QuantAlgo.NVFP4
+        and model_config.moe_backend == "MEGAMOE_CUTEDSL"
+    ):
+        # fmt: off
+        # isort: off
+        from .glm_5_2_nvfp4__sm_107__high_throughput.modeling import ModelingV2Glm52Nvfp4Sm107HighThroughput
+        # isort: on
+        # fmt: on
+        return ModelingV2Glm52Nvfp4Sm107HighThroughput
+
     # tep4: the attention heads and the dense MLPs sharded four ways, the experts
     # sharded four ways. Attention DP would replicate attention, which is a
     # different weight layout and so a different target.
@@ -147,5 +169,7 @@ def route(
         "MTP-Eagle as a linear chain or no speculative decoding; and GLM-5.2-NVFP4 "
         "on sm103, tep4 (4 ranks, tensor-parallel attention, expert-parallel MoE), "
         "with one-model MTP-Eagle at max_draft_len=1 or no speculative decoding. "
-        "Both need an fp8 latent KV cache (not the packed fp8_ds_mla layout)"
+        "Both need an fp8 latent KV cache (not the packed fp8_ds_mla layout); "
+        "the sm107 high-throughput target uses attention DP with TP16/EP16, "
+        "NVFP4 KV cache and MEGAMOE_CUTEDSL"
     )

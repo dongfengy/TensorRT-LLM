@@ -178,6 +178,7 @@ add_th_common_family(
 # GLM bindings keep their existing family targets; source lists live with the
 # model.
 add_subdirectory(glmMoeDsa)
+add_subdirectory(glmMoeDsaRubin/highThroughput)
 
 add_library(
   th_common SHARED
