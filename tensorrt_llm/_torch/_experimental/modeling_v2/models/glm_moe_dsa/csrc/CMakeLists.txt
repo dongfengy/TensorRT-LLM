@@ -25,3 +25,9 @@ add_modeling_v2_target(
   glm_moe_dsa glm_5_2_nvfp4__sm_103__tp8
   ARCHS 100f
   SOURCES *.cu *.cpp)
+
+add_modeling_v2_target(
+  glm_moe_dsa glm_5_2_nvfp4__sm_107__high_throughput
+  ARCHS 100f
+  SOURCES *.cu *.cpp
+  REQUIRES MULTI_DEVICE)
